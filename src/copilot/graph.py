@@ -128,7 +128,10 @@ def build_graph(
         # everything earlier in *its own* node on resume, so any one-time side
         # effect (submitting the pending-approval record, logging the request)
         # has to live here instead, or it would be double-recorded on resume.
-        approvals.submit(state["request_id"], summary=state["draft_answer"][:280], risk=state.get("guardrail_risk", "medium"))
+        approvals.submit(
+            state["request_id"], summary=state["draft_answer"][:280],
+            risk=state.get("guardrail_risk", "medium"), requester_user_id=state["user_id"],
+        )
         audit.log(
             request_id=state["request_id"], event_type="approval_requested",
             user_id=state["user_id"], role=state["role"], payload={"risk": state.get("guardrail_risk")},

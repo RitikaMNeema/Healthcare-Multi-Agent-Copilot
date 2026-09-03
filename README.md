@@ -216,6 +216,54 @@ short-lived CLI. The fix (`api/server.py` calls `get_retriever()` at import
 time to force that cost to happen at startup, not on a request) is a direct
 response to what the tracing showed, not a guess.
 
+## Security
+
+**Server-verified identity, not a client-supplied claim.** The FastAPI layer
+originally took `role` and `user_id` as request-body fields - meaning any
+caller could send `"role": "admin"` and bypass RBAC entirely, which quietly
+made the whole permissions story unenforceable over a network. Every
+endpoint now requires an `X-API-Key` header resolved server-side to a fixed
+`(user_id, role)` via `governance/identity.py`; `role`/`user_id` are no
+longer accepted from the client at all. Keys are stored as SHA-256 hashes
+(`data/api_keys.json`), never plaintext - `generate_api_key()` returns a raw
+key exactly once, at mint time, and persists only its hash. A real
+deployment points `COPILOT_API_KEYS_FILE` at its own, non-committed file; the
+committed one holds four fixed, intentionally public demo keys so the
+project is easy to try locally (documented above, not a real secret store).
+
+**Separation of duties on approvals.** `ApprovalQueue` now records which
+identity submitted a high-risk request (`requester_user_id`); the approval
+endpoint rejects (403) an attempt to approve or reject a request from the
+same identity that triggered it. This closes the obvious gap in a
+self-approval design: the human-in-the-loop gate is only meaningful if the
+human can't be the same actor as the one being reviewed.
+
+**Tamper-evident audit log.** Each `AuditLog.log()` call now hash-chains its
+entry to the previous one (`prev_hash` + canonical JSON of its own fields ->
+`entry_hash`, the same construction as a git commit chain) via
+`AuditLog.verify_chain()`. This doesn't stop someone with direct database
+access from rewriting the whole chain forward from a tampered row - no local
+hash chain can, without an external anchor - but it makes a *partial, silent*
+edit detectable, which is the property that actually matters for an audit
+trail: `tests/test_security.py` verifies both a tampered payload and a
+deleted row are caught. `GET /audit/verify` (admin only) exposes this over
+the API.
+
+**Rate limiting.** A per-identity fixed-window limiter
+(`governance/rate_limit.py`, 30 requests/minute by default) protects every
+authenticated endpoint - simple and in-memory rather than a dependency,
+appropriate at this project's scale, with an interface small enough to swap
+for a Redis-backed limiter behind a load balancer without touching call
+sites.
+
+**What's still out of scope, deliberately.** Real secrets management (a
+vault, KMS-backed encryption at rest), TLS termination, and actual HIPAA
+certification are infrastructure and compliance-process concerns a demo
+project doesn't own - the security work here is about making the RBAC and
+approval *logic* actually hold up against a network client that doesn't play
+along, not about standing up the surrounding infrastructure a real regulated
+deployment would need.
+
 ## Setup
 
 ```bash
@@ -259,12 +307,32 @@ python -m copilot.cli chat --query "..." --role admin --user dave
 
 ### API server
 
+Every endpoint requires an `X-API-Key` header - `role` and `user_id` are
+never accepted as request fields (see [Security](#security)). Four demo
+keys ship in `data/api_keys.json` (hashed at rest; these raw values are
+intentionally public for trying the project locally - never reuse this
+pattern for real credentials):
+
+| Key | Identity |
+|---|---|
+| `demo-viewer-key-alice` | alice / viewer |
+| `demo-operator-key-bob` | bob / operator |
+| `demo-operator-key-carol` | carol / operator |
+| `demo-admin-key-dave` | dave / admin |
+
 ```bash
 uvicorn api.server:app --reload
-# POST /chat {"query": "...", "user_id": "...", "role": "operator"}
-# POST /approvals/{request_id} {"approver": "...", "approved": true}
-# GET  /approvals
-# GET  /audit/{request_id}
+
+curl -X POST localhost:8000/chat -H "X-API-Key: demo-operator-key-bob" \
+  -H "Content-Type: application/json" -d '{"query": "Why was claim CLM-000039 denied?"}'
+
+# high-risk request from bob -> pending_approval; carol (a different identity) approves it
+curl -X POST localhost:8000/approvals/<request_id> -H "X-API-Key: demo-operator-key-carol" \
+  -H "Content-Type: application/json" -d '{"approved": true}'
+
+curl localhost:8000/approvals -H "X-API-Key: demo-operator-key-carol"
+curl localhost:8000/audit/<request_id> -H "X-API-Key: demo-operator-key-carol"
+curl localhost:8000/audit/verify -H "X-API-Key: demo-admin-key-dave"   # admin only
 ```
 
 ### Docker
@@ -279,13 +347,14 @@ docker compose up --build
 pytest -q
 ```
 
-50 tests cover: the five tools directly against known ground truth in the
+59 tests cover: the five tools directly against known ground truth in the
 synthetic claims DB; permission enforcement (including that a denied tool
 call is itself audited); input/output guardrails and citation verification
 (including hallucination detection); the hybrid retriever's ranking and its
 stopword/relative-cutoff regressions; a retrieval-benchmark regression
 (hybrid must not score below BM25-only on paraphrases); tracing/cost-calculation
-correctness; and full graph smoke
+correctness; API-key hashing, rate limiting, and audit-chain tamper detection
+(a modified payload and a deleted row are both caught); and full graph smoke
 tests across every task type, the human-in-the-loop pause/resume/reject
 paths, and the admin-vs-operator approval-routing split on an identical
 high-risk query.
