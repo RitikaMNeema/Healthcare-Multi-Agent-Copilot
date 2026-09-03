@@ -1,0 +1,30 @@
+{"id": "appeals_policy.md#0", "query": "What is the deadline for a first-level appeal?", "style": "lexical"}
+{"id": "appeals_policy.md#1", "query": "What documentation do I need to include with an appeal?", "style": "lexical"}
+{"id": "appeals_policy.md#2", "query": "Is a denial for the patient's deductible amount eligible for a provider appeal?", "style": "lexical"}
+{"id": "appeals_policy.md#3", "query": "Is it worth appealing a claim that was rejected for arriving too late?", "style": "paraphrase"}
+{"id": "appeals_policy.md#4", "query": "How are appeal outcomes categorized?", "style": "lexical"}
+{"id": "claims_submission_policy.md#0", "query": "What information has to be on a claim for it to be accepted?", "style": "paraphrase"}
+{"id": "claims_submission_policy.md#1", "query": "What is the timely filing deadline for Medicare claims?", "style": "lexical"}
+{"id": "claims_submission_policy.md#2", "query": "If I made an administrative mistake on a claim, how quickly do I need to send the fix?", "style": "paraphrase"}
+{"id": "claims_submission_policy.md#3", "query": "How quickly are electronic claims acknowledged after submission?", "style": "lexical"}
+{"id": "denial_management_policy.md#0", "query": "What are the root-cause categories for denials?", "style": "lexical"}
+{"id": "denial_management_policy.md#1", "query": "What does denial code CO-16 mean?", "style": "lexical"}
+{"id": "denial_management_policy.md#2", "query": "What does denial code CO-50 mean?", "style": "lexical"}
+{"id": "denial_management_policy.md#3", "query": "What does denial code CO-97 mean?", "style": "lexical"}
+{"id": "denial_management_policy.md#4", "query": "What does denial code PR-1 mean?", "style": "lexical"}
+{"id": "denial_management_policy.md#5", "query": "What does denial code CO-197 mean?", "style": "lexical"}
+{"id": "denial_management_policy.md#6", "query": "Why would a claim get rejected for arriving past the submission window?", "style": "paraphrase"}
+{"id": "denial_management_policy.md#7", "query": "How often should we review payer and procedure combinations with a lot of rejections?", "style": "paraphrase"}
+{"id": "hipaa_privacy_policy.md#0", "query": "What is the HIPAA minimum necessary standard?", "style": "lexical"}
+{"id": "hipaa_privacy_policy.md#1", "query": "What is the HIPAA breach notification deadline?", "style": "lexical"}
+{"id": "hipaa_privacy_policy.md#2", "query": "How fast must a patient's request to see their own chart be fulfilled?", "style": "paraphrase"}
+{"id": "hipaa_privacy_policy.md#3", "query": "What are the requirements for exporting raw patient-identifiable claims data?", "style": "lexical"}
+{"id": "hipaa_privacy_policy.md#4", "query": "Should a report showing a patient's ID next to their procedure and cost be treated carefully?", "style": "paraphrase"}
+{"id": "payer_specific_guidelines.md#0", "query": "Why does Aetna deny therapeutic exercise claims?", "style": "lexical"}
+{"id": "payer_specific_guidelines.md#1", "query": "Why does UnitedHealthcare reject so many claims for arriving late?", "style": "paraphrase"}
+{"id": "payer_specific_guidelines.md#2", "query": "Which payer rejects the fewest claims and why?", "style": "paraphrase"}
+{"id": "payer_specific_guidelines.md#3", "query": "What causes Medicare to deny knee arthroscopy claims?", "style": "lexical"}
+{"id": "prior_authorization_policy.md#0", "query": "Which procedures most often require prior authorization?", "style": "lexical"}
+{"id": "prior_authorization_policy.md#1", "query": "How many therapeutic exercise visits can happen before Aetna requires prior authorization?", "style": "lexical"}
+{"id": "prior_authorization_policy.md#2", "query": "If treatment happened without getting sign-off beforehand, can permission still be obtained afterward?", "style": "paraphrase"}
+{"id": "prior_authorization_policy.md#3", "query": "Does Medicare require prior authorization for knee arthroscopy?", "style": "lexical"}

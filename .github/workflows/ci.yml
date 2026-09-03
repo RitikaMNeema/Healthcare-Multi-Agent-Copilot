@@ -13,6 +13,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
+
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-all-MiniLM-L6-v2
 
       - name: Install
         run: pip install -e ".[dev]"
@@ -24,3 +31,6 @@ jobs:
         env:
           COPILOT_LLM_BACKEND: mock
         run: python -m eval.run_eval
+
+      - name: Retrieval benchmark
+        run: python -m eval.retrieval_benchmark

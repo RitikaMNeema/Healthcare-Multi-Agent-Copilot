@@ -1,40 +1,43 @@
-"""A small, dependency-free hybrid retriever over the local knowledge base.
+"""A hybrid retriever over the local knowledge base: BM25 + real embeddings.
 
 Two independent signals feed candidate generation, then a fused score reranks:
 
   1. BM25 (Okapi) over exact tokens - precise, and the primary channel: any
      document with a real term hit is a candidate.
-  2. A hashed character-trigram "vector" (cosine similarity) - a crude,
-     dependency-free stand-in for a real sentence embedding that tolerates
-     partial/sub-word overlap BM25 misses, used as a secondary recall path
-     (only past a threshold well above its noise floor) so it can surface a
-     paraphrase BM25 missed entirely, without being trusted enough to bury a
-     document BM25 was confident about.
+  2. Real sentence embeddings (Sentence-Transformers) indexed in FAISS,
+     cosine similarity via inner product on normalized vectors - a genuine
+     semantic signal (paraphrase, synonymy) that BM25's exact-token matching
+     misses, used as a secondary recall path (past a threshold) rather than
+     folded into a full rank-fusion score, so it can surface a paraphrase
+     BM25 missed entirely without being trusted enough to bury a document
+     BM25 was confident about.
 
-Within that candidate set, BM25 and vector scores are max-normalized and
-combined with a weighted sum (BM25-dominant), then a cheap rerank pass boosts
-exact-phrase containment and query-term coverage - a feature a single
-bi-encoder-style score doesn't capture on its own. An earlier version of this
-combined the two signals with rank-based Reciprocal Rank Fusion (RRF) instead
-of gating candidacy by BM25; that let the noisy vector ranking veto documents
-BM25 had ranked first, which is why candidacy and fusion are split apart here.
+An earlier version of this used a hashed character-trigram "vector" instead
+of real embeddings - a dependency-free stand-in that avoided any model
+download, but was noisy enough (see `eval/retrieval_benchmark.py`) that it
+had to be capped at 35% fusion weight and gated behind conservative
+thresholds tuned to its specific noise floor. Real embeddings measurably
+improve retrieval quality (run the benchmark to see the numbers) and don't
+need those same guards, but the candidate-gating architecture - BM25 decides
+who's in the running, the vector channel can only add or reorder, never
+veto - is kept because it's the right design independent of vector quality:
+a semantic signal should widen recall, not override a confirmed lexical hit.
 
-Deliberately avoids embedding-model or vector-DB dependencies so the whole
-project runs offline. Swap `_hash_vector` for a real embedding call and
-`search()`'s contract (`{"source", "text", "score"}`) doesn't need to change
-for any caller.
+FAISS does exact search (`IndexFlatIP`) here because the corpus is a few
+dozen chunks; swap in an IVF/HNSW index without changing `search()`'s
+contract (`{"source", "text", "score"}`) if the corpus grows to a scale
+where exact search stops being instant.
 """
 import math
 import os
 import re
-import zlib
 from collections import Counter
 
 TOKEN_RE = re.compile(r"[a-zA-Z0-9']+")
-VECTOR_DIMS = 1024
 BM25_WEIGHT = 0.65
-RELATIVE_SCORE_CUTOFF = 0.6
 VECTOR_WEIGHT = 0.35
+VECTOR_CANDIDATE_THRESHOLD = 0.45
+RELATIVE_SCORE_CUTOFF = 0.6
 # A tiny, uncurated policy corpus can give a common function word a spuriously
 # high IDF just by chance (e.g. "does" appearing in only one paragraph) -
 # without this filter, stopwords in the query can outweigh the actual content
@@ -54,30 +57,14 @@ def tokenize(text: str) -> list[str]:
     return [t.lower() for t in TOKEN_RE.findall(text)]
 
 
-def _char_trigrams(text: str) -> list[str]:
-    padded = f"  {text.lower()}  "
-    return [padded[i:i + 3] for i in range(len(padded) - 2)]
-
-
-def _hash_vector(text: str, dims: int = VECTOR_DIMS) -> list[float]:
-    vec = [0.0] * dims
-    for trigram in _char_trigrams(text):
-        vec[zlib.crc32(trigram.encode("utf-8")) % dims] += 1.0
-    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-    return [v / norm for v in vec]
-
-
-def _cosine(a: list[float], b: list[float]) -> float:
-    return sum(x * y for x, y in zip(a, b))
-
-
 class Retriever:
-    def __init__(self, kb_dir: str, k1: float = 1.5, b: float = 0.75):
+    def __init__(self, kb_dir: str, k1: float = 1.5, b: float = 0.75, embedder=None):
         self.kb_dir = kb_dir
         self.k1 = k1
         self.b = b
         self.chunks: list[dict] = []
         self._load(kb_dir)
+        self.embedder = embedder
         self._build_index()
 
     def _load(self, kb_dir: str) -> None:
@@ -107,7 +94,17 @@ class Retriever:
             for term in set(toks):
                 self.df[term] += 1
 
-        self.doc_vectors = [_hash_vector(c["text"]) for c in self.chunks]
+        self.faiss_index = None
+        if self.chunks:
+            import faiss
+
+            if self.embedder is None:
+                from copilot.rag.embeddings import get_embedder
+
+                self.embedder = get_embedder()
+            doc_embeddings = self.embedder.encode([c["text"] for c in self.chunks])
+            self.faiss_index = faiss.IndexFlatIP(doc_embeddings.shape[1])
+            self.faiss_index.add(doc_embeddings)
 
     def _idf(self, term: str) -> float:
         df = self.df.get(term, 0)
@@ -128,6 +125,17 @@ class Retriever:
             score += idf * (f * (self.k1 + 1)) / (denom or 1)
         return score
 
+    def _vector_scores(self, query: str) -> list[float]:
+        if self.faiss_index is None:
+            return [0.0] * self.n_docs
+        query_embedding = self.embedder.encode([query])
+        similarities, indices = self.faiss_index.search(query_embedding, self.n_docs)
+        scores = [0.0] * self.n_docs
+        for sim, idx in zip(similarities[0], indices[0]):
+            if idx >= 0:
+                scores[idx] = float(sim)
+        return scores
+
     def _rerank(self, query: str, query_tokens: list[str], candidates: list[tuple[float, int]]) -> list[tuple[float, int]]:
         query_lower = query.lower()
         query_term_set = set(query_tokens)
@@ -146,22 +154,19 @@ class Retriever:
             return []
 
         query_tokens = tokenize(query)
-        query_vector = _hash_vector(query)
-
         bm25_scores = [self._bm25_score(query_tokens, i) for i in range(self.n_docs)]
-        vector_scores = [_cosine(query_vector, self.doc_vectors[i]) for i in range(self.n_docs)]
+        vector_scores = self._vector_scores(query)
 
         # Candidate generation: BM25 hits are the primary channel (any real
         # term overlap qualifies); the vector channel is a secondary recall
-        # path that can surface a paraphrase/morphological match BM25 missed
-        # entirely, but only past a threshold well above the hashed vector's
-        # noise floor on a corpus this small (~0.1-0.2 for unrelated text).
-        # Gating candidacy this way - rather than folding vector into a
-        # full-corpus rank-fusion score - means the noisy vector signal can
-        # never bury a document BM25 was confident about; it can only add
-        # documents BM25 missed, or nudge order within the confirmed set.
+        # path that can surface a paraphrase/synonym match BM25 missed
+        # entirely, but only past a threshold. Gating candidacy this way -
+        # rather than folding vector into a full-corpus rank-fusion score -
+        # means the vector signal can never bury a document BM25 was
+        # confident about; it can only add documents BM25 missed, or nudge
+        # order within the confirmed set.
         candidate_idxs = {i for i in range(self.n_docs) if bm25_scores[i] > 0}
-        candidate_idxs |= {i for i in range(self.n_docs) if vector_scores[i] > 0.35}
+        candidate_idxs |= {i for i in range(self.n_docs) if vector_scores[i] > VECTOR_CANDIDATE_THRESHOLD}
         if not candidate_idxs:
             return []
 
@@ -178,9 +183,7 @@ class Retriever:
 
         # A relative-score cutoff, not just the k cap: when the top hit clearly
         # dominates (a single-fact question with one strong match), a much
-        # weaker runner-up shouldn't ride along just to fill k slots - that's
-        # how an unrelated paragraph that happens to share one word with the
-        # query ends up quoted in an answer that never needed it. Multiple
+        # weaker runner-up shouldn't ride along just to fill k slots. Multiple
         # genuinely close hits (comparable scores) still all come through.
         if top_k:
             score_floor = top_k[0][0] * RELATIVE_SCORE_CUTOFF

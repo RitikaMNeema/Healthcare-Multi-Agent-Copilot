@@ -15,6 +15,9 @@ eval:
 eval-update-baseline:
 	python -m eval.run_eval --update-baseline
 
+retrieval-benchmark:
+	python -m eval.retrieval_benchmark
+
 serve:
 	uvicorn api.server:app --reload
 

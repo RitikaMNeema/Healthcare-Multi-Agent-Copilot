@@ -19,7 +19,8 @@ script (`data/generate_claims.py`) - nothing in this repo is real PHI.
 | Multi-agent orchestration (LangGraph state machine) | `src/copilot/graph.py` |
 | Planner / executor / critic agents | `src/copilot/agents/` |
 | Tool use & function calling (manual agentic loop, strict schemas) | `src/copilot/agents/executor.py`, `src/copilot/tools/` |
-| **Hybrid RAG** (BM25 + hashed-vector, fused and reranked) | `src/copilot/rag/retriever.py` |
+| **Hybrid RAG** (BM25 + real embeddings via FAISS, fused and reranked) | `src/copilot/rag/retriever.py`, `src/copilot/rag/embeddings.py` |
+| **Retrieval benchmark** (Recall@k/MRR, proves the embedding swap helped) | `eval/retrieval_benchmark.py` |
 | **Synthetic claims database** (520 claims, seeded/reproducible) | `data/generate_claims.py`, `data/claims.db` |
 | Guardrails (input + output, static + LLM-judged) | `src/copilot/guardrails/` |
 | **Claim-level citation verification** | `src/copilot/guardrails/citation_check.py` |
@@ -112,21 +113,60 @@ process exiting or an API server restart.
    with a real term hit is a candidate. A small, hand-curated stopword list
    keeps a common function word from getting a spuriously high IDF just
    because it happens to be rare in a small policy corpus.
-2. **A hashed character-trigram "vector"** (cosine similarity) - a
-   dependency-free stand-in for a real sentence embedding, used as a
-   *secondary recall path* past a noise-floor threshold, not folded into a
-   full rank-fusion score. An earlier version of this combined the two
-   signals with rank-based Reciprocal Rank Fusion; that let the noisier
-   vector signal veto a document BM25 was confident about, so candidacy and
-   fusion were split apart instead.
+2. **Real sentence embeddings** (`sentence-transformers/all-MiniLM-L6-v2`,
+   384-dim, ~90MB) indexed in **FAISS** (`IndexFlatIP` - exact cosine search;
+   swap in IVF/HNSW without changing `search()`'s contract if the corpus
+   outgrows exact search), used as a *secondary recall path* past a
+   noise-floor threshold, not folded into a full rank-fusion score. An
+   earlier version of this project used a hashed character-trigram "vector"
+   instead - a dependency-free stand-in that avoided any model download but
+   was measurably too noisy to trust; see the benchmark below. Candidacy is
+   gated by BM25 (any real term hit qualifies) with the vector channel only
+   ever adding documents BM25 missed, never burying one it was confident
+   about - an earlier rank-based fusion (Reciprocal Rank Fusion) let a noisy
+   vector ranking veto BM25's top pick, which is why candidacy and fusion are
+   split apart.
 
 Within the candidate set, scores are max-normalized and combined
 BM25-dominant, then a cheap rerank pass boosts exact-phrase containment and
 query-term coverage. A relative-score cutoff (not just the `k` cap) drops a
 much-weaker runner-up rather than letting it ride along just to fill slots -
 which is what previously caused an unrelated paragraph to get pulled into an
-otherwise-unrelated answer. Swap `_hash_vector` for a real embedding call any
-time; `search()`'s contract (`{"source", "text", "score"}`) doesn't change.
+otherwise-unrelated answer.
+
+The model downloads once from the Hugging Face Hub (`~/.cache/huggingface`)
+and runs fully offline after that - no API key, no per-query cost,
+deterministic given fixed weights.
+
+### Retrieval benchmark
+
+```bash
+python -m eval.retrieval_benchmark
+```
+
+A 30-query labeled set (`eval/retrieval_labels.jsonl`, one query per
+knowledge-base paragraph, split lexical vs. paraphrase) measures Recall@1,
+Recall@3, and MRR across five configurations, so the embedding swap is a
+measured improvement, not just a different-looking architecture:
+
+| Config | R@1 | R@3 | MRR | Paraphrase R@1 | Paraphrase MRR |
+|---|---|---|---|---|---|
+| BM25 only | 0.667 | 0.833 | 0.767 | 0.4 | 0.502 |
+| Legacy hashed-vector only | 0.5 | 0.733 | 0.633 | 0.5 | 0.555 |
+| Real embeddings only | 0.8 | 0.967 | 0.875 | 0.7 | 0.792 |
+| **Hybrid, legacy vector (old production)** | 0.667 | 0.867 | 0.776 | 0.4 | 0.529 |
+| **Hybrid, real embeddings (current production)** | 0.8 | 0.9 | 0.857 | 0.6 | 0.672 |
+
+Holding the hybrid architecture constant and swapping only the vector
+channel (the two bolded rows) moves MRR from 0.776 to 0.857 and paraphrase
+MRR from 0.529 to 0.672 - a direct, isolated measurement of what the
+embedding upgrade bought, not a side effect of also changing the fusion
+logic. Note real-embeddings-only edges out the hybrid on this particular
+labeled set; the hybrid is still the production default because BM25's exact
+matching matters for this domain's short, structurally similar denial-code
+lookups ("CO-16" vs. "CO-50" vs. "CO-97") in a way a 30-query benchmark on a
+30-chunk corpus doesn't fully stress-test - a benefit worth stating rather
+than silently discarding in favor of the single best number.
 
 ## Citation verification
 
@@ -152,7 +192,9 @@ cp .env.example .env             # optionally set ANTHROPIC_API_KEY for live Cla
 ```
 
 Without `ANTHROPIC_API_KEY`, everything below runs against the deterministic
-mock backend (`COPILOT_LLM_BACKEND=mock`, auto-selected).
+mock backend (`COPILOT_LLM_BACKEND=mock`, auto-selected). The first command
+that touches retrieval downloads the embedding model (~90MB, one-time,
+requires network); everything after that is fully offline.
 
 ## Usage
 
@@ -203,13 +245,15 @@ docker compose up --build
 pytest -q
 ```
 
-41 tests cover: the five tools directly against known ground truth in the
+44 tests cover: the five tools directly against known ground truth in the
 synthetic claims DB; permission enforcement (including that a denied tool
 call is itself audited); input/output guardrails and citation verification
 (including hallucination detection); the hybrid retriever's ranking and its
-stopword/relative-cutoff regressions; and full graph smoke tests across every
-task type, the human-in-the-loop pause/resume/reject paths, and the
-admin-vs-operator approval-routing split on an identical high-risk query.
+stopword/relative-cutoff regressions; a retrieval-benchmark regression
+(hybrid must not score below BM25-only on paraphrases); and full graph smoke
+tests across every task type, the human-in-the-loop pause/resume/reject
+paths, and the admin-vs-operator approval-routing split on an identical
+high-risk query.
 
 ## Eval harness
 
