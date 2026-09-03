@@ -13,10 +13,10 @@ from copilot.config import default_checkpoint_db_path
 from copilot.governance import permissions
 from copilot.governance.approvals import ApprovalQueue
 from copilot.governance.audit import AuditLog
+from copilot.guardrails.citation_check import verify_citations
 from copilot.guardrails.input_guardrails import check_input
 from copilot.guardrails.output_guardrails import scan_output
 from copilot.llm import get_backend
-from copilot.rag.retriever import get_retriever
 from copilot.state import CopilotState
 
 _RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
@@ -64,42 +64,40 @@ def build_graph(llm=None, audit: AuditLog | None = None, approvals: ApprovalQueu
             user_id=state["user_id"], role=state["role"],
             payload={"task_type": result.task_type, "steps": result.steps, "model": used_model},
         )
-        return {
-            "task_type": result.task_type,
-            "plan_steps": result.steps,
-            "plan_needs_retrieval": result.needs_retrieval,
-            "used_model": used_model,
-        }
-
-    def route_after_plan(state: CopilotState) -> str:
-        return "retrieve" if state.get("plan_needs_retrieval", True) else "execute"
-
-    def node_retrieve(state: CopilotState) -> dict:
-        results = get_retriever().search(state["query"], k=3)
-        audit.log(
-            request_id=state["request_id"], event_type="retrieval",
-            user_id=state["user_id"], role=state["role"],
-            payload={"num_results": len(results), "sources": [r["source"] for r in results]},
-        )
-        return {"retrieved_context": results}
+        return {"task_type": result.task_type, "plan_steps": result.steps, "used_model": used_model}
 
     def node_execute(state: CopilotState) -> dict:
-        answer, used_model = executor_agent.execute(
-            llm,
-            query=state["query"], role=state["role"], request_id=state["request_id"], user_id=state["user_id"],
-            retrieved_context=state.get("retrieved_context", []), audit=audit,
+        result = executor_agent.execute(
+            llm, query=state["query"], role=state["role"], request_id=state["request_id"],
+            user_id=state["user_id"], audit=audit,
         )
         audit.log(
             request_id=state["request_id"], event_type="draft_answer",
-            user_id=state["user_id"], role=state["role"], payload={"model": used_model},
+            user_id=state["user_id"], role=state["role"],
+            payload={"model": result.used_model, "tools_used": result.tools_used},
         )
-        return {"draft_answer": answer, "used_model": used_model}
+        return {
+            "draft_answer": result.answer,
+            "used_model": result.used_model,
+            "tools_used": result.tools_used,
+            "evidence_claim_ids": result.evidence_claim_ids,
+            "evidence_doc_sources": result.evidence_doc_sources,
+        }
 
     def node_critic(state: CopilotState) -> dict:
         static_risk, static_issues = scan_output(state["draft_answer"])
         verdict, _ = critic_agent.review(llm, state["draft_answer"])
-        final_risk = max([static_risk, verdict.risk], key=lambda r: _RISK_ORDER[r])
-        issues = list(dict.fromkeys(static_issues + verdict.issues))  # de-dupe, preserve order
+        citation_issues = verify_citations(
+            state["draft_answer"],
+            evidence_doc_sources=set(state.get("evidence_doc_sources", [])),
+            evidence_claim_ids=set(state.get("evidence_claim_ids", [])),
+        )
+        # An unverified citation is itself at least a medium-risk finding - a
+        # plausible-looking but ungrounded document or claim reference is
+        # exactly the kind of thing that should stop for human review.
+        risks = [static_risk, verdict.risk] + (["medium"] if citation_issues else [])
+        final_risk = max(risks, key=lambda r: _RISK_ORDER[r])
+        issues = list(dict.fromkeys(static_issues + verdict.issues + citation_issues))  # de-dupe, preserve order
         requires_approval = final_risk != "low" or verdict.requires_approval
         audit.log(
             request_id=state["request_id"], event_type="guardrail_verdict",
@@ -160,7 +158,6 @@ def build_graph(llm=None, audit: AuditLog | None = None, approvals: ApprovalQueu
     graph.add_node("input_guard", node_input_guard)
     graph.add_node("blocked", node_blocked)
     graph.add_node("plan", node_plan)
-    graph.add_node("retrieve", node_retrieve)
     graph.add_node("execute", node_execute)
     graph.add_node("critic", node_critic)
     graph.add_node("request_approval", node_request_approval)
@@ -170,8 +167,7 @@ def build_graph(llm=None, audit: AuditLog | None = None, approvals: ApprovalQueu
     graph.set_entry_point("input_guard")
     graph.add_conditional_edges("input_guard", route_after_input_guard, {"blocked": "blocked", "plan": "plan"})
     graph.add_edge("blocked", END)
-    graph.add_conditional_edges("plan", route_after_plan, {"retrieve": "retrieve", "execute": "execute"})
-    graph.add_edge("retrieve", "execute")
+    graph.add_edge("plan", "execute")
     graph.add_edge("execute", "critic")
     graph.add_conditional_edges("critic", route_after_critic, {"needs_approval": "request_approval", "finalize": "finalize"})
     graph.add_edge("request_approval", "await_approval")

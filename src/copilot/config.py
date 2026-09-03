@@ -11,6 +11,7 @@ FALLBACK_MODELS = [
 ]
 
 KB_DIR = os.environ.get("COPILOT_KB_DIR", os.path.join(_REPO_ROOT, "data", "knowledge_base"))
+CLAIMS_DB_PATH = os.environ.get("COPILOT_CLAIMS_DB", os.path.join(_REPO_ROOT, "data", "claims.db"))
 MAX_TOOL_ITERATIONS = int(os.environ.get("COPILOT_MAX_TOOL_ITERATIONS", "4"))
 
 

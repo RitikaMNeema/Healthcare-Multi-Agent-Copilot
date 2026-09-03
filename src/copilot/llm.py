@@ -8,8 +8,10 @@ tool routing, guardrail scoring, judging) runnable offline and reproducibly.
 Both implement the same three-method surface, so every agent module is
 written against the interface, never against `anthropic` directly.
 """
+import ast
 import re
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from typing import Protocol
 
 from pydantic import BaseModel
@@ -78,54 +80,172 @@ class FakeMessage:
     stop_reason: str
 
 
-_MATH_HINT_RE = re.compile(r"\d+\s*[-+*/]\s*\d+")
-_MATH_EXPR_RE = re.compile(r"[-+]?\(?[\d.\s+\-*/()]{3,}\)?")
-_FILE_RE = re.compile(r"[a-zA-Z0-9_\-]+\.md")
 _GREETING_RE = re.compile(r"^\s*(hi|hello|hey)\b", re.I)
 
+PAYER_NAMES = ["BlueCross BlueShield", "UnitedHealthcare", "Medicare", "Aetna"]
+_PAYER_RE = re.compile("|".join(re.escape(p) for p in PAYER_NAMES), re.I)
+_DENIAL_CODE_RE = re.compile(r"\b(CO|PR)-?(\d{1,3})\b", re.I)
+_PROCEDURE_CODE_RE = re.compile(r"\b(\d{5}|[A-Z]\d{4})\b")
+_CLAIM_ID_RE = re.compile(r"\bCLM-?(\d{6})\b", re.I)
 
-def _extract_text(messages: list[dict]) -> str:
-    last = messages[-1]["content"]
-    if isinstance(last, str):
-        return last
-    parts = []
-    for block in last:
-        if isinstance(block, dict) and block.get("type") == "text":
-            parts.append(block["text"])
-        elif isinstance(block, str):
-            parts.append(block)
-    return "\n".join(parts)
+_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+}
+_MONTH_YEAR_RE = re.compile(r"\b(" + "|".join(_MONTHS) + r")\s+(\d{4})\b", re.I)
+
+REMEDIATION_KEYWORDS = ("remediation plan", "reduce denials", "reduce the denial", "fix this denial pattern", "root cause")
+METRIC_KEYWORDS = ("denial rate", "overturn rate", "top denial code", "most common denial", "claim volume", "total billed")
+CLAIMS_QUERY_KEYWORDS = (
+    "list claims", "list the claims", "show me the claims", "show claims", "find claims",
+    "how many claims", "look up claims", "look up the claims", "pull the claims",
+)
+POLICY_HINT_KEYWORDS = (
+    "policy", "polic", "hipaa", "authorization", "appeal", "deadline", "requirement",
+    "allowed", "rule", "timely filing", "minimum necessary", "breach notification",
+)
 
 
-def _extract_context_and_query(user_text: str) -> tuple[str, str]:
-    match = re.search(r"Context:\n(.*?)\n\nRequest: (.*)", user_text, re.S)
-    if match:
-        return match.group(1).strip(), match.group(2).strip()
-    return "", user_text
-
-
-def _extract_math_expression(text: str) -> str | None:
-    if not _MATH_HINT_RE.search(text):
+def extract_payer(text: str) -> str | None:
+    match = _PAYER_RE.search(text)
+    if not match:
         return None
-    for match in _MATH_EXPR_RE.finditer(text):
-        candidate = match.group().strip()
-        if any(op in candidate for op in "+-*/") and any(ch.isdigit() for ch in candidate):
-            return candidate
-    return None
+    matched = match.group()
+    return next((p for p in PAYER_NAMES if p.lower() == matched.lower()), None)
+
+
+def extract_denial_code(text: str) -> str | None:
+    match = _DENIAL_CODE_RE.search(text)
+    return f"{match.group(1).upper()}-{match.group(2)}" if match else None
+
+
+def extract_procedure_code(text: str) -> str | None:
+    match = _PROCEDURE_CODE_RE.search(text)
+    return match.group(1) if match else None
+
+
+def extract_claim_id(text: str) -> str | None:
+    match = _CLAIM_ID_RE.search(text)
+    return f"CLM-{match.group(1)}" if match else None
+
+
+def extract_month_range(text: str) -> tuple[str | None, str | None]:
+    match = _MONTH_YEAR_RE.search(text)
+    if not match:
+        return None, None
+    month, year = _MONTHS[match.group(1).lower()], int(match.group(2))
+    start = date(year, month, 1)
+    end = date(year, 12, 31) if month == 12 else date(year, month + 1, 1) - timedelta(days=1)
+    return start.isoformat(), end.isoformat()
 
 
 def classify_task_type(query: str) -> str:
-    lowered = query.lower()
     if _GREETING_RE.match(query):
         return "general"
-    if _extract_math_expression(query) or "calculate" in lowered or "compute" in lowered:
-        return "tool_task"
-    if _FILE_RE.search(query) or "read the file" in lowered or "read file" in lowered:
-        return "tool_task"
-    question_starts = ("what", "how", "why", "who", "when", "where", "explain", "describe")
-    if "?" in query or lowered.startswith(question_starts):
-        return "research"
+    lowered = query.lower()
+    if extract_claim_id(query):
+        return "denial_analysis"
+    if any(kw in lowered for kw in REMEDIATION_KEYWORDS):
+        return "remediation"
+    if any(kw in lowered for kw in METRIC_KEYWORDS):
+        return "metrics"
+    if any(kw in lowered for kw in CLAIMS_QUERY_KEYWORDS):
+        return "claims_query"
+    question_starts = ("what", "how", "why", "who", "when", "where", "explain", "describe", "is", "are", "does")
+    if "?" in query or lowered.startswith(question_starts) or any(kw in lowered for kw in POLICY_HINT_KEYWORDS):
+        return "policy_lookup"
     return "general"
+
+
+def _decide_tool(query: str, tool_names: set[str]) -> tuple[str, dict] | None:
+    claim_id = extract_claim_id(query)
+    if claim_id and "analyze_denial" in tool_names:
+        return "analyze_denial", {"claim_id": claim_id}
+
+    lowered = query.lower()
+
+    if any(kw in lowered for kw in REMEDIATION_KEYWORDS) and "create_remediation_plan" in tool_names:
+        return "create_remediation_plan", {
+            "payer": extract_payer(query), "denial_code": extract_denial_code(query),
+            "procedure_code": extract_procedure_code(query),
+        }
+
+    metric = None
+    if "denial rate" in lowered:
+        metric = "denial_rate"
+    elif "overturn rate" in lowered:
+        metric = "overturn_rate"
+    elif "top denial code" in lowered or "most common denial" in lowered:
+        metric = "top_denial_codes"
+    elif "claim volume" in lowered or "total billed" in lowered:
+        metric = "claim_volume"
+    if metric and "calculate_denial_metrics" in tool_names:
+        start_date, end_date = extract_month_range(query)
+        return "calculate_denial_metrics", {
+            "metric": metric, "payer": extract_payer(query), "procedure_code": extract_procedure_code(query),
+            "denial_code": extract_denial_code(query), "start_date": start_date, "end_date": end_date,
+        }
+
+    if any(kw in lowered for kw in CLAIMS_QUERY_KEYWORDS) and "query_claims" in tool_names:
+        start_date, end_date = extract_month_range(query)
+        status = next((s for s in ("denied", "paid", "appealed") if s in lowered), None)
+        return "query_claims", {
+            "payer": extract_payer(query), "denial_code": extract_denial_code(query),
+            "procedure_code": extract_procedure_code(query), "status": status,
+            "start_date": start_date, "end_date": end_date, "limit": 10,
+        }
+
+    if "search_payer_policy" in tool_names:
+        return "search_payer_policy", {"query": query, "top_k": 3}
+
+    return None
+
+
+def _format_tool_result_answer(tool_name: str | None, tool_input: dict, tool_result_text: str) -> str:
+    try:
+        parsed = ast.literal_eval(tool_result_text)
+    except (ValueError, SyntaxError):
+        return f"Based on the tool result, the answer is: {tool_result_text}"
+
+    if tool_name == "search_payer_policy" and isinstance(parsed, list):
+        if not parsed:
+            return "No relevant policy documentation was found."
+        citations = "; ".join(f"[{hit['source']}] {hit['text']}" for hit in parsed)
+        return f"Based on internal policy documentation: {citations}"
+
+    if tool_name == "analyze_denial" and isinstance(parsed, dict):
+        if parsed.get("denial_code") is None:
+            return f"Claim {parsed['claim_id']} was not denied (status: {parsed.get('status')})."
+        actions = " ".join(parsed.get("recommended_actions", []))
+        return (
+            f"Claim {parsed['claim_id']} ({parsed['payer']}, procedure {parsed['procedure_code']}) was denied "
+            f"with code {parsed['denial_code']} ({parsed['denial_code_meaning']}). "
+            f"Appealable: {parsed['is_appealable']}. Appeal filed: {parsed['appeal_filed']}, "
+            f"outcome: {parsed.get('appeal_outcome')}. Recommended next steps: {actions}"
+        )
+
+    if tool_name == "query_claims" and isinstance(parsed, dict):
+        claim_ids = ", ".join(c["claim_id"] for c in parsed.get("claims", []))
+        return (
+            f"Found {parsed['total_matching_count']} matching claims "
+            f"(showing {parsed['returned_count']}: {claim_ids})."
+        )
+
+    if tool_name == "calculate_denial_metrics" and isinstance(parsed, dict):
+        filters = {k: v for k, v in (tool_input or {}).items() if k != "metric" and v is not None}
+        filter_desc = ", ".join(f"{k}={v}" for k, v in filters.items()) or "no filters"
+        return f"Metric result for {filter_desc}: {parsed}"
+
+    if tool_name == "create_remediation_plan" and isinstance(parsed, dict):
+        refs = " ".join(f"[{r}]" for r in parsed.get("policy_references", []))
+        actions = " ".join(parsed.get("recommended_actions", []))
+        return (
+            f"Remediation plan for {parsed.get('pattern_summary')}: "
+            f"root-cause breakdown {parsed.get('denial_code_breakdown')}. "
+            f"Recommended actions: {actions} Policy references: {refs}"
+        )
+
+    return f"Based on the tool result, the answer is: {tool_result_text}"
 
 
 class MockBackend:
@@ -138,9 +258,15 @@ class MockBackend:
 
         if name == "PlannerOutput":
             task_type = classify_task_type(text)
-            steps = ["retrieve relevant context", "draft an answer", "run guardrail checks"]
-            needs_retrieval = task_type != "general"
-            return schema(task_type=task_type, steps=steps, needs_retrieval=needs_retrieval)
+            steps = {
+                "policy_lookup": ["search payer/claims/appeals policy", "cite the relevant document"],
+                "claims_query": ["query the claims database with the requested filters", "summarize matching claims"],
+                "denial_analysis": ["look up the specific claim", "explain the denial and next steps"],
+                "metrics": ["compute the requested aggregate metric", "report the result"],
+                "remediation": ["aggregate the denial pattern", "draft recommended remediation actions"],
+                "general": ["answer directly"],
+            }[task_type]
+            return schema(task_type=task_type, steps=steps)
 
         if name == "GuardrailVerdict":
             from copilot.guardrails.output_guardrails import scan_output
@@ -179,46 +305,53 @@ class MockBackend:
         )
 
         if has_tool_result:
+            prior_assistant = messages[-2]["content"]
+            tool_use_block = next((b for b in prior_assistant if getattr(b, "type", None) == "tool_use"), None)
+            tool_name = tool_use_block.name if tool_use_block else None
+            tool_input = tool_use_block.input if tool_use_block else {}
             tool_result_text = next(
                 c["content"] for c in last_content if isinstance(c, dict) and c.get("type") == "tool_result"
             )
-            text = f"Based on the tool result, the answer is: {tool_result_text}"
+            text = _format_tool_result_answer(tool_name, tool_input, tool_result_text)
             return FakeMessage(content=[Block(type="text", text=text)], stop_reason="end_turn")
 
-        user_text = _extract_text(messages)
-        context, query = _extract_context_and_query(user_text)
+        query = _extract_text(messages)
         tool_names = {t["name"] for t in tools}
 
         if _GREETING_RE.match(query):
             text = (
-                "Hi! I can look up internal engineering policy in the knowledge base, run "
-                "simple calculations, and - for admins - read specific knowledge-base files. "
-                "Access is role-based: viewers can search and ask questions, operators can also "
-                "use the calculator, and admins can read files and auto-approve their own "
-                "high-risk requests. Anything flagged medium or high risk is held for human "
-                "review unless your role is allowed to auto-approve it."
+                "Hi! I can look up payer, claims, appeals, prior-authorization, and HIPAA privacy policy, "
+                "query claims records, explain a specific claim's denial, compute aggregate denial metrics, "
+                "and - for admins - build a remediation plan for a denial pattern. Access is role-based: "
+                "viewers get policy search and aggregate metrics only, operators can also query individual "
+                "claims and denials, and admins can additionally generate remediation plans and auto-approve "
+                "their own high-risk requests. Anything flagged medium or high risk is held for human review "
+                "unless your role is allowed to auto-approve it."
             )
             return FakeMessage(content=[Block(type="text", text=text)], stop_reason="end_turn")
 
-        file_match = _FILE_RE.search(query)
-        if file_match and "read_file" in tool_names:
-            return FakeMessage(
-                content=[Block(type="tool_use", name="read_file", input={"filename": file_match.group()}, id="mock_1")],
-                stop_reason="tool_use",
-            )
+        decision = _decide_tool(query, tool_names)
+        if decision is None:
+            return FakeMessage(content=[Block(type="text", text=f"[mock] {query}")], stop_reason="end_turn")
 
-        expr = _extract_math_expression(query)
-        if expr and "calculator" in tool_names:
-            return FakeMessage(
-                content=[Block(type="tool_use", name="calculator", input={"expression": expr}, id="mock_1")],
-                stop_reason="tool_use",
-            )
+        tool_name, tool_input = decision
+        return FakeMessage(
+            content=[Block(type="tool_use", name=tool_name, input=tool_input, id="mock_1")],
+            stop_reason="tool_use",
+        )
 
-        if context and context != "No relevant context found.":
-            text = f"Based on internal documentation: {context}"
-        else:
-            text = f"[mock] {query}"
-        return FakeMessage(content=[Block(type="text", text=text)], stop_reason="end_turn")
+
+def _extract_text(messages: list[dict]) -> str:
+    last = messages[-1]["content"]
+    if isinstance(last, str):
+        return last
+    parts = []
+    for block in last:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block["text"])
+        elif isinstance(block, str):
+            parts.append(block)
+    return "\n".join(parts)
 
 
 def get_backend() -> LLMBackend:

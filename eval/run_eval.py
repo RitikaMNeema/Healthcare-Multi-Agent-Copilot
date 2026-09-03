@@ -39,7 +39,8 @@ def run_case(app, llm, case: dict) -> dict:
     interrupted = "__interrupt__" in result
 
     if interrupted:
-        result = resume_request(app, request_id=request_id, approved=True, approver="eval-harness")
+        approved = case.get("resume_decision", True)
+        result = resume_request(app, request_id=request_id, approved=approved, approver="eval-harness")
 
     checks: dict[str, bool] = {}
     if "expected_task_type" in case:
@@ -53,6 +54,11 @@ def run_case(app, llm, case: dict) -> dict:
         checks["blocked_as_expected"] = bool(result.get("blocked", False)) == case["expect_blocked"]
     if "expect_interrupt" in case:
         checks["interrupt_as_expected"] = interrupted == case["expect_interrupt"]
+    if "expected_tool" in case:
+        checks["tool_selection_correct"] = case["expected_tool"] in result.get("tools_used", [])
+    if case.get("require_clean_citations"):
+        issues = result.get("guardrail_issues", [])
+        checks["citations_verified"] = not any("unverified citation" in issue for issue in issues)
 
     answer = result.get("final_answer", "")
     verdict = judge(llm, query=case["query"], answer=answer, criteria=case.get("criteria", ""))

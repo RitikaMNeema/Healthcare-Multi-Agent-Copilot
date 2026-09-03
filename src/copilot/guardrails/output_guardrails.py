@@ -8,9 +8,13 @@ PII_PATTERNS = {
 
 BANNED_PHRASES = [
     "how to hack into",
-    "social security number",
-    "credit card number",
     "how to make a bomb",
+    # Matches the HIPAA policy's own wording for a bulk PHI export - a single
+    # claim/casework lookup never needs this phrase, so its presence is a
+    # reliable signal the answer is discussing (or enabling) a bulk export
+    # of patient-identifiable data rather than routine individual casework.
+    "patient-identifiable claims data",
+    "patient's social security number",
 ]
 
 

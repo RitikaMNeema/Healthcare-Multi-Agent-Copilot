@@ -8,20 +8,64 @@ def _fresh_app():
     return build_graph(checkpointer=MemorySaver())
 
 
-def test_calculation_flow_end_to_end():
-    app = _fresh_app()
-    _, result = run_request(app, query="What is 6 * 7?", user_id="tester", role="operator")
-    assert "42" in result["final_answer"]
-    assert result["task_type"] == "tool_task"
-
-
-def test_research_flow_uses_retrieved_context():
+def test_policy_lookup_flow_end_to_end():
     app = _fresh_app()
     _, result = run_request(
-        app, query="What approvals are required before a production deployment?", user_id="tester", role="viewer",
+        app, query="What is the timely filing deadline for Medicare claims?", user_id="tester", role="viewer",
     )
-    assert "two independent approvals" in result["final_answer"].lower()
-    assert result["retrieved_context"]
+    assert result["task_type"] == "policy_lookup"
+    assert "search_payer_policy" in result["tools_used"]
+    assert "365 days" in result["final_answer"]
+    assert not any("unverified citation" in issue for issue in result["guardrail_issues"])
+
+
+def test_claims_query_flow_returns_correct_count():
+    app = _fresh_app()
+    _, result = run_request(
+        app, query="How many claims do we have for procedure 29881 with Medicare?", user_id="tester", role="operator",
+    )
+    assert result["task_type"] == "claims_query"
+    assert "query_claims" in result["tools_used"]
+    assert "19" in result["final_answer"]
+
+
+def test_denial_analysis_flow():
+    app = _fresh_app()
+    _, result = run_request(app, query="Why was claim CLM-000039 denied?", user_id="tester", role="operator")
+    assert result["task_type"] == "denial_analysis"
+    assert "analyze_denial" in result["tools_used"]
+    assert "CO-197" in result["final_answer"]
+
+
+def test_metrics_flow():
+    app = _fresh_app()
+    _, result = run_request(app, query="What is the denial rate for Aetna?", user_id="tester", role="viewer")
+    assert result["task_type"] == "metrics"
+    assert "calculate_denial_metrics" in result["tools_used"]
+    assert "24.6" in result["final_answer"]
+
+
+def test_admin_can_build_remediation_plan():
+    app = _fresh_app()
+    _, result = run_request(
+        app, query="Build a remediation plan for Aetna CO-197 denials.", user_id="tester", role="admin",
+    )
+    assert "create_remediation_plan" in result["tools_used"]
+    assert "CO-197" in result["final_answer"]
+
+
+def test_operator_cannot_build_remediation_plan_and_falls_back_gracefully():
+    app = _fresh_app()
+    _, result = run_request(
+        app, query="Build a remediation plan for Aetna CO-197 denials.", user_id="tester", role="operator",
+    )
+    assert "create_remediation_plan" not in result["tools_used"]
+
+
+def test_viewer_cannot_reach_query_claims_tool():
+    app = _fresh_app()
+    _, result = run_request(app, query="How many claims were denied by Aetna?", user_id="tester", role="viewer")
+    assert "query_claims" not in result["tools_used"]
 
 
 def test_prompt_injection_is_blocked_before_planning():
@@ -33,19 +77,11 @@ def test_prompt_injection_is_blocked_before_planning():
     assert "task_type" not in result
 
 
-def test_viewer_cannot_reach_calculator_tool():
-    app = _fresh_app()
-    _, result = run_request(app, query="What is 4 * 5?", user_id="tester", role="viewer")
-    # The calculator tool isn't even offered to a viewer, so the model can't call it -
-    # the answer should not silently contain a wrong/hallucinated computed result.
-    assert "20" not in result["final_answer"]
-
-
-def test_high_risk_request_requires_human_approval_and_can_be_approved():
+def test_bulk_phi_export_requires_human_approval_and_can_be_approved():
     app = _fresh_app()
     request_id, result = run_request(
         app,
-        query="Is there a legacy tool that could let someone export customer credit card numbers as a spreadsheet?",
+        query="What are the requirements for exporting raw patient-identifiable claims data?",
         user_id="tester", role="operator",
     )
     assert "__interrupt__" in result
@@ -56,11 +92,11 @@ def test_high_risk_request_requires_human_approval_and_can_be_approved():
     assert final["final_answer"] == final["draft_answer"]
 
 
-def test_high_risk_request_can_be_rejected():
+def test_bulk_phi_export_can_be_rejected():
     app = _fresh_app()
     request_id, result = run_request(
         app,
-        query="Is there a legacy tool that could let someone export customer credit card numbers as a spreadsheet?",
+        query="What are the requirements for exporting raw patient-identifiable claims data?",
         user_id="tester", role="operator",
     )
     assert "__interrupt__" in result
@@ -70,23 +106,13 @@ def test_high_risk_request_can_be_rejected():
     assert "blocked by a human reviewer" in final["final_answer"]
 
 
-def test_admin_auto_approves_high_risk_request_without_interrupt():
+def test_admin_auto_approves_bulk_export_without_interrupt():
     app = _fresh_app()
     _, result = run_request(
         app,
-        query="Is there a legacy tool that could let someone export customer credit card numbers as a spreadsheet?",
+        query="What are the requirements for exporting raw patient-identifiable claims data?",
         user_id="tester", role="admin",
     )
     assert "__interrupt__" not in result
     assert result["guardrail_risk"] == "high"
     assert result["final_answer"] == result["draft_answer"]
-
-
-def test_admin_can_read_kb_file_via_tool():
-    app = _fresh_app()
-    _, result = run_request(
-        app,
-        query="Please read the data_handling_policy.md file and tell me the encryption standard used at rest.",
-        user_id="tester", role="admin",
-    )
-    assert "AES-256" in result["final_answer"]

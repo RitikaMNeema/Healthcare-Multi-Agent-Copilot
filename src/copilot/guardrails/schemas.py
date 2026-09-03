@@ -4,9 +4,8 @@ from pydantic import BaseModel, Field
 
 
 class PlannerOutput(BaseModel):
-    task_type: Literal["research", "tool_task", "general"]
+    task_type: Literal["policy_lookup", "claims_query", "denial_analysis", "metrics", "remediation", "general"]
     steps: list[str] = Field(min_length=1, max_length=6)
-    needs_retrieval: bool
 
 
 class GuardrailVerdict(BaseModel):

@@ -8,9 +8,21 @@ class RolePolicy:
 
 
 ROLE_POLICIES: dict[str, RolePolicy] = {
-    "viewer": RolePolicy(allowed_tools=frozenset({"search_kb"}), auto_approve=False),
-    "operator": RolePolicy(allowed_tools=frozenset({"search_kb", "calculator"}), auto_approve=False),
-    "admin": RolePolicy(allowed_tools=frozenset({"search_kb", "calculator", "read_file"}), auto_approve=True),
+    # HIPAA minimum-necessary tiers: viewers get policy text and aggregate metrics
+    # only (no individual, PHI-adjacent claim records); operators can look up
+    # individual claims/denials for casework; admins can additionally generate
+    # cross-payer remediation plans and auto-approve their own high-risk requests.
+    "viewer": RolePolicy(allowed_tools=frozenset({"search_payer_policy", "calculate_denial_metrics"}), auto_approve=False),
+    "operator": RolePolicy(
+        allowed_tools=frozenset({"search_payer_policy", "calculate_denial_metrics", "query_claims", "analyze_denial"}),
+        auto_approve=False,
+    ),
+    "admin": RolePolicy(
+        allowed_tools=frozenset({
+            "search_payer_policy", "calculate_denial_metrics", "query_claims", "analyze_denial", "create_remediation_plan",
+        }),
+        auto_approve=True,
+    ),
 }
 
 

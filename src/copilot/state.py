@@ -12,12 +12,12 @@ class CopilotState(TypedDict, total=False):
 
     task_type: str
     plan_steps: list[str]
-    plan_needs_retrieval: bool
-
-    retrieved_context: list[dict]
 
     draft_answer: str
     used_model: str
+    tools_used: list[str]
+    evidence_claim_ids: list[str]
+    evidence_doc_sources: list[str]
 
     guardrail_risk: str
     guardrail_issues: list[str]
