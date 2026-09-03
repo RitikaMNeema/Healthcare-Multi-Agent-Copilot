@@ -33,6 +33,7 @@ script (`data/generate_claims.py`) - nothing in this repo is real PHI.
 | **Permissions / RBAC** (HIPAA minimum-necessary tiers) | `src/copilot/governance/permissions.py`, enforced in `src/copilot/tools/registry.py` |
 | **Observability** (OpenTelemetry tracing, latency + token-cost dashboard) | `src/copilot/observability/` |
 | Production deployment (FastAPI + Docker) | `api/`, `Dockerfile`, `docker-compose.yml` |
+| **Load testing** (concurrent throughput/latency, found a real SQLite bottleneck) | `scripts/load_test.py` |
 
 ## The domain
 
@@ -341,13 +342,45 @@ curl localhost:8000/audit/verify -H "X-API-Key: demo-admin-key-dave"   # admin o
 docker compose up --build
 ```
 
+## Load testing
+
+```bash
+python scripts/load_test.py --concurrency 20 --requests 300
+```
+
+Starts a fresh copy of the API server as a subprocess with its own isolated
+state and a batch of throwaway API-key identities generated just for that
+run (real virtual users, not one key hammered past its own rate limit),
+fires concurrent requests at it, tears the server down, and reports
+throughput and latency percentiles. With the default mock backend this
+measures the system's own overhead - graph routing, guardrails, SQLite I/O -
+not Claude API latency, since a mock call is near-instant; pass
+`--backend claude` (with `ANTHROPIC_API_KEY` set) to include real model
+latency.
+
+Running it is what surfaced a real bottleneck rather than a guessed one: at
+concurrency 20, p50/p95/p99 latency was 46/421/1025ms; at concurrency 50 it
+degraded to 141/1003/1613ms, while throughput barely moved (88 -> 146 req/s)
+- a classic single-writer lock signature, from SQLite's default
+rollback-journal mode serializing the audit log, checkpointer, and approval
+queue writes every request touches. Switching those connections to WAL mode
+(`src/copilot/sqlite_utils.py`) and re-running at the same concurrencies
+tightened the tail dramatically and consistently across repeated runs -
+concurrency 20: p50/p95/p99 = 124/210/270ms (p99 dropped ~4x); concurrency
+50: 318/580/605ms (p99 dropped ~3x, max dropped from 1792ms to 752ms) - at
+the cost of a somewhat higher median, an honest trade worth stating rather
+than only reporting the number that improved. The next lever, if traffic
+grew further, is what the numbers point at directly: move the audit log,
+checkpointer, and approval queue off SQLite onto a database built for
+concurrent writers (Postgres) rather than continuing to tune SQLite pragmas.
+
 ## Tests
 
 ```bash
 pytest -q
 ```
 
-59 tests cover: the five tools directly against known ground truth in the
+62 tests cover: the five tools directly against known ground truth in the
 synthetic claims DB; permission enforcement (including that a denied tool
 call is itself audited); input/output guardrails and citation verification
 (including hallucination detection); the hybrid retriever's ranking and its

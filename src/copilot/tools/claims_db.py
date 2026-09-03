@@ -6,6 +6,7 @@ and `create_remediation_plan` never disagree with each other about what a code m
 import sqlite3
 
 from copilot.config import CLAIMS_DB_PATH
+from copilot.sqlite_utils import connect as sqlite_connect
 
 DENIAL_CODE_MEANINGS = {
     "CO-16": "Claim/service lacks information needed for adjudication",
@@ -47,7 +48,7 @@ REMEDIATION_PLAYBOOKS = {
 
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(CLAIMS_DB_PATH)
+    conn = sqlite_connect(CLAIMS_DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 

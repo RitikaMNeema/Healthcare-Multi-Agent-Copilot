@@ -21,6 +21,9 @@ retrieval-benchmark:
 observability-report:
 	python -m copilot.observability.report
 
+load-test:
+	python scripts/load_test.py --concurrency 20 --requests 300
+
 serve:
 	uvicorn api.server:app --reload
 

@@ -1,9 +1,9 @@
 import os
-import sqlite3
 import time
 from contextlib import contextmanager
 
 from copilot.config import default_audit_db_path
+from copilot.sqlite_utils import connect as sqlite_connect
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pending_approvals (
@@ -38,7 +38,7 @@ class ApprovalQueue:
 
     @contextmanager
     def _connect(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite_connect(self.db_path)
         try:
             yield conn
             conn.commit()

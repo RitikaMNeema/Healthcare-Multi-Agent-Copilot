@@ -10,5 +10,7 @@ data/traces.jsonl
 data/observability_dashboard.html
 eval/last_report.json
 eval/retrieval_benchmark_report.json
+data/loadtest_run/
+data/load_test_report.json
 
 .env

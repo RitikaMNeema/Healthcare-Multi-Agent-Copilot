@@ -1,12 +1,12 @@
 import hashlib
 import json
 import os
-import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
 
 from copilot.config import default_audit_db_path
+from copilot.sqlite_utils import connect as sqlite_connect
 
 GENESIS_HASH = "0" * 64
 
@@ -57,7 +57,7 @@ class AuditLog:
 
     @contextmanager
     def _connect(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite_connect(self.db_path)
         try:
             yield conn
             conn.commit()

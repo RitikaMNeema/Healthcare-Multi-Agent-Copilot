@@ -1,5 +1,4 @@
 import os
-import sqlite3
 import uuid
 
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -18,6 +17,7 @@ from copilot.guardrails.input_guardrails import check_input
 from copilot.guardrails.output_guardrails import scan_output
 from copilot.llm import get_backend
 from copilot.observability.tracing import Tracing
+from copilot.sqlite_utils import connect as sqlite_connect
 from copilot.state import CopilotState
 
 _RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
@@ -30,7 +30,7 @@ def _default_checkpointer() -> SqliteSaver:
     actually usable outside of a single long-lived process."""
     path = default_checkpoint_db_path()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite_connect(path, check_same_thread=False)
     return SqliteSaver(conn)
 
 
