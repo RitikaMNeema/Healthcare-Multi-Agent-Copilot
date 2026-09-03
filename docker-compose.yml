@@ -1,0 +1,11 @@
+services:
+  copilot-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - COPILOT_PRIMARY_MODEL=${COPILOT_PRIMARY_MODEL:-claude-opus-5}
+      - COPILOT_FALLBACK_MODELS=${COPILOT_FALLBACK_MODELS:-claude-sonnet-5,claude-haiku-4-5}
+    volumes:
+      - ./data:/app/data
