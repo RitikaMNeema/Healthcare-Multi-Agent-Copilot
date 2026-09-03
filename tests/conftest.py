@@ -12,4 +12,5 @@ os.environ["COPILOT_LLM_BACKEND"] = "mock"
 def isolated_state_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("COPILOT_AUDIT_DB", str(tmp_path / "audit.db"))
     monkeypatch.setenv("COPILOT_CHECKPOINT_DB", str(tmp_path / "checkpoints.db"))
+    monkeypatch.setenv("COPILOT_TRACE_LOG", str(tmp_path / "traces.jsonl"))
     yield

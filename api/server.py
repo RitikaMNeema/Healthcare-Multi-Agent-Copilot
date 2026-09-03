@@ -10,12 +10,19 @@ from pydantic import BaseModel
 from copilot.governance.approvals import ApprovalQueue
 from copilot.governance.audit import AuditLog
 from copilot.graph import build_graph, resume_request, run_request
+from copilot.rag.retriever import get_retriever
 
 app = FastAPI(title="Governed Multi-Agent Copilot", version="0.1.0")
 
 _audit = AuditLog()
 _approvals = ApprovalQueue()
 _graph = build_graph(audit=_audit, approvals=_approvals)
+
+# Loading the embedding model is a multi-second cold start (see
+# data/observability_dashboard.html after any run - it shows up as the first
+# search_payer_policy call). A long-lived server should pay that cost once at
+# startup, not on whichever request happens to be first.
+get_retriever()
 
 
 class ChatRequest(BaseModel):

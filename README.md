@@ -31,6 +31,7 @@ script (`data/generate_claims.py`) - nothing in this repo is real PHI.
 | **Eval harness** (30-case golden dataset, regression checks, LLM-as-judge) | `eval/` |
 | **Audit trails** (append-only SQLite log of every decision) | `src/copilot/governance/audit.py` |
 | **Permissions / RBAC** (HIPAA minimum-necessary tiers) | `src/copilot/governance/permissions.py`, enforced in `src/copilot/tools/registry.py` |
+| **Observability** (OpenTelemetry tracing, latency + token-cost dashboard) | `src/copilot/observability/` |
 | Production deployment (FastAPI + Docker) | `api/`, `Dockerfile`, `docker-compose.yml` |
 
 ## The domain
@@ -182,6 +183,39 @@ detection path itself is covered directly in `tests/test_guardrails.py`
 against fabricated citation text, which is a more reliable way to prove that
 path works than waiting for a mock to misbehave.
 
+## Observability
+
+Every graph node, tool call, and LLM call is wrapped in a real OpenTelemetry
+span (`src/copilot/observability/tracing.py`) - `TracerProvider`,
+`SpanProcessor`, `SpanExporter`, `Span`, the standard SDK primitives, not a
+custom logging shim. Spans are exported as JSON lines to `data/traces.jsonl`
+by a small local `JSONLSpanExporter`; swap that one class for
+`OTLPSpanExporter` pointed at Jaeger, Tempo, Honeycomb, or LangFuse's OTLP
+endpoint to ship the exact same spans to a real backend without touching any
+instrumentation call site. Each `Tracing` instance is its own object (not the
+process-global provider), the same pattern `AuditLog`/`ApprovalQueue` use, so
+tests isolate their own trace output instead of fighting over one global.
+
+LLM call spans on the real Claude backend carry `input_tokens`,
+`output_tokens`, and a computed `cost_usd` (`observability/cost.py`, priced
+per the current Anthropic API rates); the mock backend's spans honestly
+report no cost rather than fabricating numbers.
+
+```bash
+python -m copilot.observability.report
+```
+
+Reads `data/traces.jsonl`, prints p50/p95/p99 latency per span name and a
+token-cost breakdown by model, and writes a static HTML dashboard to
+`data/observability_dashboard.html`. Building this surfaced a real finding
+worth calling out rather than burying: the *first* `search_payer_policy` call
+in a process takes several seconds because that's when the embedding model
+lazily loads - invisible in a long-lived API server (paid once at whichever
+request happens to arrive first) but repeated on every invocation of the
+short-lived CLI. The fix (`api/server.py` calls `get_retriever()` at import
+time to force that cost to happen at startup, not on a request) is a direct
+response to what the tracing showed, not a guess.
+
 ## Setup
 
 ```bash
@@ -245,12 +279,13 @@ docker compose up --build
 pytest -q
 ```
 
-44 tests cover: the five tools directly against known ground truth in the
+50 tests cover: the five tools directly against known ground truth in the
 synthetic claims DB; permission enforcement (including that a denied tool
 call is itself audited); input/output guardrails and citation verification
 (including hallucination detection); the hybrid retriever's ranking and its
 stopword/relative-cutoff regressions; a retrieval-benchmark regression
-(hybrid must not score below BM25-only on paraphrases); and full graph smoke
+(hybrid must not score below BM25-only on paraphrases); tracing/cost-calculation
+correctness; and full graph smoke
 tests across every task type, the human-in-the-loop pause/resume/reject
 paths, and the admin-vs-operator approval-routing split on an identical
 high-risk query.

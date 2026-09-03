@@ -23,6 +23,10 @@ def default_checkpoint_db_path() -> str:
     return os.environ.get("COPILOT_CHECKPOINT_DB", os.path.join(_REPO_ROOT, "data", "checkpoints.db"))
 
 
+def default_trace_log_path() -> str:
+    return os.environ.get("COPILOT_TRACE_LOG", os.path.join(_REPO_ROOT, "data", "traces.jsonl"))
+
+
 def llm_backend_name() -> str:
     explicit = os.environ.get("COPILOT_LLM_BACKEND")
     if explicit:

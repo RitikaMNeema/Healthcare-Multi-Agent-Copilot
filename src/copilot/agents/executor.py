@@ -26,7 +26,7 @@ class ExecutionResult:
     evidence_doc_sources: list[str] = field(default_factory=list)
 
 
-def execute(llm, *, query: str, role: str, request_id: str, user_id: str, audit) -> ExecutionResult:
+def execute(llm, *, query: str, role: str, request_id: str, user_id: str, audit, tracing=None) -> ExecutionResult:
     tool_specs = registry.tool_definitions_for_role(role)
     messages: list[dict] = [{"role": "user", "content": query}]
     result = ExecutionResult(answer="", used_model=PRIMARY_MODEL)
@@ -51,7 +51,7 @@ def execute(llm, *, query: str, role: str, request_id: str, user_id: str, audit)
             try:
                 tool_result = registry.invoke_tool(
                     tool_use.name, tool_use.input,
-                    role=role, user_id=user_id, request_id=request_id, audit=audit,
+                    role=role, user_id=user_id, request_id=request_id, audit=audit, tracing=tracing,
                 )
                 _record_evidence(result, tool_use.name, tool_result)
                 tool_results.append({"type": "tool_result", "tool_use_id": tool_use.id, "content": str(tool_result)})

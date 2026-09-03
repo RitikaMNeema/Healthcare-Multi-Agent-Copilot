@@ -10,6 +10,7 @@ written against the interface, never against `anthropic` directly.
 """
 import ast
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Protocol
@@ -17,7 +18,32 @@ from typing import Protocol
 from pydantic import BaseModel
 
 from copilot.config import llm_backend_name
+from copilot.observability.cost import estimate_cost_usd
 from copilot.rag.retriever import tokenize
+
+
+@contextmanager
+def _llm_span(tracing, span_name: str, model: str, **extra_attrs):
+    """No-op if `tracing` is None, so every LLM call site can call this
+    unconditionally. `record(usage)` sets token/cost attributes on the span
+    if a real usage object was returned - the mock backend calls `record(None)`,
+    which honestly reports no tokens/cost rather than fabricating numbers."""
+    if tracing is None:
+        yield lambda usage: None
+        return
+    with tracing.span(span_name, model=model, **extra_attrs) as span:
+        def record(usage) -> None:
+            if usage is None:
+                return
+            input_tokens = getattr(usage, "input_tokens", None)
+            output_tokens = getattr(usage, "output_tokens", None)
+            if input_tokens is not None:
+                span.set_attribute("input_tokens", input_tokens)
+            if output_tokens is not None:
+                span.set_attribute("output_tokens", output_tokens)
+            if input_tokens is not None and output_tokens is not None:
+                span.set_attribute("cost_usd", estimate_cost_usd(model, input_tokens, output_tokens))
+        yield record
 
 
 class LLMBackend(Protocol):
@@ -33,32 +59,40 @@ class LLMBackend(Protocol):
 # --------------------------------------------------------------------------
 
 class ClaudeBackend:
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, tracing=None):
         import anthropic
 
         from copilot.config import PRIMARY_MODEL
 
         self.default_model = model or PRIMARY_MODEL
         self.client = anthropic.Anthropic()
+        self.tracing = tracing
 
     def complete_structured(self, *, system, messages, schema, model=None):
-        response = self.client.messages.parse(
-            model=model or self.default_model,
-            max_tokens=1024,
-            system=system,
-            messages=messages,
-            output_format=schema,
-        )
-        return response.parsed_output
+        resolved_model = model or self.default_model
+        with _llm_span(self.tracing, "llm.complete_structured", resolved_model, schema=schema.__name__) as record:
+            response = self.client.messages.parse(
+                model=resolved_model,
+                max_tokens=1024,
+                system=system,
+                messages=messages,
+                output_format=schema,
+            )
+            record(getattr(response, "usage", None))
+            return response.parsed_output
 
     def complete_with_tools(self, *, system, messages, tools, max_tokens=1024, model=None):
-        return self.client.messages.create(
-            model=model or self.default_model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=messages,
-            tools=tools,
-        )
+        resolved_model = model or self.default_model
+        with _llm_span(self.tracing, "llm.complete_with_tools", resolved_model) as record:
+            response = self.client.messages.create(
+                model=resolved_model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages,
+                tools=tools,
+            )
+            record(getattr(response, "usage", None))
+            return response
 
 
 # --------------------------------------------------------------------------
@@ -249,10 +283,17 @@ def _format_tool_result_answer(tool_name: str | None, tool_input: dict, tool_res
 
 
 class MockBackend:
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, tracing=None):
         self.default_model = model or "mock"
+        self.tracing = tracing
 
     def complete_structured(self, *, system, messages, schema, model=None):
+        with _llm_span(self.tracing, "llm.complete_structured", self.default_model, schema=schema.__name__) as record:
+            result = self._complete_structured_impl(system=system, messages=messages, schema=schema)
+            record(None)  # mock: no real token usage to report
+            return result
+
+    def _complete_structured_impl(self, *, system, messages, schema):
         name = schema.__name__
         text = _extract_text(messages)
 
@@ -299,6 +340,12 @@ class MockBackend:
         raise NotImplementedError(f"MockBackend cannot fabricate schema {name!r}")
 
     def complete_with_tools(self, *, system, messages, tools, max_tokens=1024, model=None):
+        with _llm_span(self.tracing, "llm.complete_with_tools", self.default_model) as record:
+            result = self._complete_with_tools_impl(system=system, messages=messages, tools=tools, max_tokens=max_tokens)
+            record(None)  # mock: no real token usage to report
+            return result
+
+    def _complete_with_tools_impl(self, *, system, messages, tools, max_tokens=1024):
         last_content = messages[-1]["content"]
         has_tool_result = isinstance(last_content, list) and any(
             isinstance(c, dict) and c.get("type") == "tool_result" for c in last_content
@@ -354,5 +401,5 @@ def _extract_text(messages: list[dict]) -> str:
     return "\n".join(parts)
 
 
-def get_backend() -> LLMBackend:
-    return MockBackend() if llm_backend_name() == "mock" else ClaudeBackend()
+def get_backend(tracing=None) -> LLMBackend:
+    return MockBackend(tracing=tracing) if llm_backend_name() == "mock" else ClaudeBackend(tracing=tracing)

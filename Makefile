@@ -18,6 +18,9 @@ eval-update-baseline:
 retrieval-benchmark:
 	python -m eval.retrieval_benchmark
 
+observability-report:
+	python -m copilot.observability.report
+
 serve:
 	uvicorn api.server:app --reload
 
