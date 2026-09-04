@@ -5,6 +5,7 @@ class CopilotState(TypedDict, total=False):
     request_id: str
     user_id: str
     role: str
+    tenant_id: str
     query: str
 
     blocked: bool

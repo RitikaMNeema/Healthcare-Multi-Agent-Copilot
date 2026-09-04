@@ -1,18 +1,32 @@
 {
   "7b649a0dae37d25849dee5a0e9cb74f74ad20a99137b8274c71d64147dd77645": {
     "user_id": "alice",
-    "role": "viewer"
+    "role": "viewer",
+    "tenant_id": "tenant-a"
   },
   "74bc59eea5739e3b654d86aa38654341ca29ae2719e38275f69047903a3be71c": {
     "user_id": "bob",
-    "role": "operator"
+    "role": "operator",
+    "tenant_id": "tenant-a"
   },
   "0032ea5c62c0e3f6d3a10088d2bfc3842324eca5d8611d9a71d12d337ab40068": {
     "user_id": "carol",
-    "role": "operator"
+    "role": "operator",
+    "tenant_id": "tenant-a"
   },
   "f47b09e08249db9d6b6fc22f0ab857bb325176c79463781af9630d99697dec93": {
     "user_id": "dave",
-    "role": "admin"
+    "role": "admin",
+    "tenant_id": "tenant-a"
+  },
+  "5350f9ed42a4d51a56043e83c6e596a3cf7fb97d19c85b47d9dad00b4296ca27": {
+    "user_id": "eve",
+    "role": "compliance_officer",
+    "tenant_id": "tenant-a"
+  },
+  "112ff3e32d3ab3450e1c918facdf0a24978e606f7054d336644fe30261a6ba7f": {
+    "user_id": "frank",
+    "role": "operator",
+    "tenant_id": "tenant-b"
   }
 }

@@ -10,7 +10,7 @@ Every invocation - permitted or denied - is written to the audit log.
 """
 from contextlib import nullcontext
 
-from copilot.governance import permissions
+from copilot.governance import permissions, redaction
 from copilot.tools.analyze_denial import analyze_denial
 from copilot.tools.calculate_denial_metrics import VALID_METRICS, calculate_denial_metrics
 from copilot.tools.claims_db import VALID_PAYERS
@@ -139,14 +139,14 @@ def invoke_tool(name: str, tool_input: dict, *, role: str, user_id: str, request
         if name not in permissions.allowed_tools(role):
             audit.log(
                 request_id=request_id, event_type="tool_denied", user_id=user_id, role=role,
-                payload={"tool": name, "input": tool_input},
+                payload={"tool": name, "input_hash": redaction.hash_identifier(repr(sorted(tool_input.items())))},
             )
             raise ToolPermissionDenied(f"role '{role}' is not permitted to use tool '{name}'")
 
         result = TOOL_HANDLERS[name](tool_input)
         audit.log(
             request_id=request_id, event_type="tool_invoked", user_id=user_id, role=role,
-            payload={"tool": name, "input": tool_input, "result": result},
+            payload=redaction.summarize_for_audit(tool_name=name, tool_input=tool_input, result=result),
         )
         return result
 

@@ -1,11 +1,14 @@
 """API-key identity resolution for the HTTP surface.
 
-The FastAPI layer must never trust a client-supplied `role` or `user_id` -
-a JSON field is just a claim, easily forged (any caller could set
-`"role": "admin"` and bypass RBAC entirely). An identity resolved from a
-server-held key -> (user_id, role) mapping is a fact instead. Keys are
-stored hashed (SHA-256), never in plaintext, so a leaked copy of the
-identities file doesn't hand out working credentials.
+The FastAPI layer must never trust a client-supplied `role`, `user_id`, or
+`tenant_id` - a JSON field is just a claim, easily forged. An identity
+resolved from a server-held key -> (user_id, role, tenant_id) mapping is a
+fact instead. Keys are stored hashed (SHA-256), never in plaintext, so a
+leaked copy of the identities file doesn't hand out working credentials.
+
+`tenant_id` enforces that one organization's requests, approvals, and audit
+records are invisible to another's callers, even an admin/compliance_officer
+in a different tenant - see the tenant checks in `api/server.py`.
 
 The committed `data/api_keys.json` holds a handful of fixed, publicly
 documented demo keys (see README) for trying the project locally - clearly
@@ -20,6 +23,8 @@ import os
 import secrets
 
 from copilot.config import default_api_keys_path
+
+DEFAULT_TENANT_ID = "default"
 
 
 class UnknownAPIKeyError(Exception):
@@ -39,21 +44,22 @@ def load_identities(path: str | None = None) -> dict:
 
 
 def resolve_identity(raw_key: str, path: str | None = None) -> dict:
-    """Returns {"user_id": ..., "role": ...} for a valid key, else raises."""
+    """Returns {"user_id", "role", "tenant_id"} for a valid key, else raises."""
     identities = load_identities(path)
     identity = identities.get(_hash_key(raw_key))
     if identity is None:
         raise UnknownAPIKeyError("invalid or unknown API key")
+    identity.setdefault("tenant_id", DEFAULT_TENANT_ID)
     return identity
 
 
-def generate_api_key(user_id: str, role: str, path: str | None = None) -> str:
+def generate_api_key(user_id: str, role: str, tenant_id: str = DEFAULT_TENANT_ID, path: str | None = None) -> str:
     """Mints a new identity and returns the raw key - the only time it's ever
     visible. Only its hash is written to disk."""
     path = path or default_api_keys_path()
     identities = load_identities(path)
     raw_key = secrets.token_urlsafe(24)
-    identities[_hash_key(raw_key)] = {"user_id": user_id, "role": role}
+    identities[_hash_key(raw_key)] = {"user_id": user_id, "role": role, "tenant_id": tenant_id}
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(identities, f, indent=2)

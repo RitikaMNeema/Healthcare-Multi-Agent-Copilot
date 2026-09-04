@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 
 import pytest
@@ -13,7 +14,7 @@ def test_generate_and_resolve_api_key(tmp_path):
     raw_key = generate_api_key("newuser", "operator", path=path)
 
     identity = resolve_identity(raw_key, path=path)
-    assert identity == {"user_id": "newuser", "role": "operator"}
+    assert identity == {"user_id": "newuser", "role": "operator", "tenant_id": "default"}
 
 
 def test_unknown_api_key_rejected(tmp_path):
@@ -92,3 +93,35 @@ def test_audit_chain_detects_deleted_row():
     is_valid, broken_id = audit.verify_chain()
     assert is_valid is False
     assert broken_id == second_id
+
+
+def test_audit_chain_survives_concurrent_writers(tmp_path):
+    # Without BEGIN IMMEDIATE around read-last-hash-then-insert, two threads
+    # can both read the same "last hash" and each compute a chain entry
+    # against it, corrupting the total order. 8 threads x 25 writes each is
+    # enough to reliably trigger that race on the old (unlocked) code path.
+    audit = AuditLog(db_path=str(tmp_path / "concurrent_audit.db"))
+    n_threads = 8
+    writes_per_thread = 25
+    errors: list[Exception] = []
+
+    def writer(thread_id: int) -> None:
+        try:
+            for i in range(writes_per_thread):
+                audit.log(request_id=f"r-{thread_id}", event_type="concurrent_write", payload={"i": i})
+        except Exception as exc:  # noqa: BLE001 - capture for the main thread to assert on
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(t,)) for t in range(n_threads)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+
+    is_valid, broken_id = audit.verify_chain()
+    assert is_valid is True, f"chain broken at {broken_id}"
+
+    all_events = audit.recent(limit=n_threads * writes_per_thread + 10)
+    assert len(all_events) == n_threads * writes_per_thread

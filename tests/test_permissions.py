@@ -50,10 +50,15 @@ def test_unknown_role_raises():
         permissions.allowed_tools("superuser")
 
 
-def test_only_admin_auto_approves():
-    assert permissions.can_auto_approve("admin") is True
-    assert permissions.can_auto_approve("operator") is False
-    assert permissions.can_auto_approve("viewer") is False
+def test_only_admin_and_compliance_officer_can_review_approvals():
+    assert permissions.can_review_approvals("admin") is True
+    assert permissions.can_review_approvals("compliance_officer") is True
+    assert permissions.can_review_approvals("operator") is False
+    assert permissions.can_review_approvals("viewer") is False
+
+
+def test_compliance_officer_has_minimal_tool_access():
+    assert permissions.allowed_tools("compliance_officer") == {"search_payer_policy"}
 
 
 def test_tool_definitions_for_role_filters_correctly():

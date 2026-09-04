@@ -17,20 +17,27 @@ CREATE TABLE IF NOT EXISTS audit_events (
     ts REAL NOT NULL,
     user_id TEXT,
     role TEXT,
+    tenant_id TEXT,
     event_type TEXT NOT NULL,
     payload TEXT NOT NULL,
     prev_hash TEXT NOT NULL,
     entry_hash TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_request ON audit_events(request_id);
+CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_events(tenant_id);
+CREATE TABLE IF NOT EXISTS audit_chain_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    trusted_genesis_hash TEXT NOT NULL
+);
 """
 
 
 def _compute_entry_hash(prev_hash: str, *, event_id: str, request_id: str, ts: float,
-                         user_id: str | None, role: str | None, event_type: str, payload_json: str) -> str:
+                         user_id: str | None, role: str | None, tenant_id: str | None,
+                         event_type: str, payload_json: str) -> str:
     canonical = json.dumps(
         {"id": event_id, "request_id": request_id, "ts": ts, "user_id": user_id,
-         "role": role, "event_type": event_type, "payload": payload_json},
+         "role": role, "tenant_id": tenant_id, "event_type": event_type, "payload": payload_json},
         sort_keys=True,
     )
     return hashlib.sha256((prev_hash + canonical).encode("utf-8")).hexdigest()
@@ -47,6 +54,16 @@ class AuditLog:
     somewhere append-only) - but it does mean tampering can't hide, only be
     made total, which is the property that actually matters for an audit
     trail: silent, partial edits become detectable.
+
+    Payloads passed to `log()` are the caller's responsibility to minimize -
+    see `governance/redaction.py` - this class stores whatever it's given
+    verbatim (hash-chained, not encrypted at the row level) and does not
+    itself inspect payload content.
+
+    `log()` wraps its read-last-hash-then-insert in a single `BEGIN
+    IMMEDIATE` transaction so two concurrent writers can't both read the same
+    "last hash" and each compute a chain entry against it - see
+    `tests/test_security.py`'s concurrent-writer test.
     """
 
     def __init__(self, db_path: str | None = None):
@@ -54,6 +71,9 @@ class AuditLog:
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            conn.execute(
+                "INSERT OR IGNORE INTO audit_chain_meta (id, trusted_genesis_hash) VALUES (1, ?)", (GENESIS_HASH,),
+            )
 
     @contextmanager
     def _connect(self):
@@ -65,42 +85,84 @@ class AuditLog:
             conn.close()
 
     def log(self, *, request_id: str, event_type: str, payload: dict | None = None,
-             user_id: str | None = None, role: str | None = None) -> str:
+             user_id: str | None = None, role: str | None = None, tenant_id: str | None = None) -> str:
         event_id = str(uuid.uuid4())
         ts = time.time()
         payload_json = json.dumps(payload or {}, default=str)
 
-        with self._connect() as conn:
+        # Autocommit mode (isolation_level=None) so our own explicit BEGIN
+        # IMMEDIATE takes effect instead of sqlite3's implicit deferred
+        # transaction - IMMEDIATE grabs the write lock before the SELECT,
+        # so no other writer's INSERT can land between "read last hash" and
+        # "insert this entry".
+        conn = sqlite_connect(self.db_path, isolation_level=None)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
             last_hash_row = conn.execute("SELECT entry_hash FROM audit_events ORDER BY rowid DESC LIMIT 1").fetchone()
             prev_hash = last_hash_row[0] if last_hash_row else GENESIS_HASH
             entry_hash = _compute_entry_hash(
                 prev_hash, event_id=event_id, request_id=request_id, ts=ts,
-                user_id=user_id, role=role, event_type=event_type, payload_json=payload_json,
+                user_id=user_id, role=role, tenant_id=tenant_id, event_type=event_type, payload_json=payload_json,
             )
             conn.execute(
-                "INSERT INTO audit_events (id, request_id, ts, user_id, role, event_type, payload, prev_hash, entry_hash) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (event_id, request_id, ts, user_id, role, event_type, payload_json, prev_hash, entry_hash),
+                "INSERT INTO audit_events "
+                "(id, request_id, ts, user_id, role, tenant_id, event_type, payload, prev_hash, entry_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (event_id, request_id, ts, user_id, role, tenant_id, event_type, payload_json, prev_hash, entry_hash),
             )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
         return event_id
 
     def trail_for(self, request_id: str) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, request_id, ts, user_id, role, event_type, payload "
+                "SELECT id, request_id, ts, user_id, role, tenant_id, event_type, payload "
                 "FROM audit_events WHERE request_id = ? ORDER BY rowid",
                 (request_id,),
             ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
-    def recent(self, limit: int = 50) -> list[dict]:
+    def recent(self, limit: int = 50, tenant_id: str | None = None) -> list[dict]:
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT id, request_id, ts, user_id, role, event_type, payload "
-                "FROM audit_events ORDER BY rowid DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            if tenant_id is not None:
+                rows = conn.execute(
+                    "SELECT id, request_id, ts, user_id, role, tenant_id, event_type, payload "
+                    "FROM audit_events WHERE tenant_id = ? ORDER BY rowid DESC LIMIT ?",
+                    (tenant_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, request_id, ts, user_id, role, tenant_id, event_type, payload "
+                    "FROM audit_events ORDER BY rowid DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
         return [_row_to_dict(row) for row in rows]
+
+    def purge_older_than(self, cutoff_ts: float) -> int:
+        """Retention enforcement: permanently deletes events older than
+        `cutoff_ts`. This is the *only* sanctioned way to shorten the chain:
+        it records what the new oldest surviving row's `prev_hash` legitimately
+        is in `audit_chain_meta` before deleting, so `verify_chain()` still
+        expects exactly that value afterward. An attacker deleting the same
+        rows directly (bypassing this method) leaves the meta table
+        unchanged, so verify_chain still catches it - only deletion *through
+        this method* is trusted, not deletion of old-enough rows in general.
+        Real deployments should archive purged rows (encrypted, access-logged)
+        before deleting, per the retention policy documented in the README -
+        this method only performs the deletion half."""
+        with self._connect() as conn:
+            new_first = conn.execute(
+                "SELECT prev_hash FROM audit_events WHERE ts >= ? ORDER BY rowid LIMIT 1", (cutoff_ts,),
+            ).fetchone()
+            cursor = conn.execute("DELETE FROM audit_events WHERE ts < ?", (cutoff_ts,))
+            if new_first is not None:
+                conn.execute("UPDATE audit_chain_meta SET trusted_genesis_hash = ? WHERE id = 1", (new_first[0],))
+            return cursor.rowcount
 
     def verify_chain(self) -> tuple[bool, str | None]:
         """Recomputes every entry's hash from its stored fields and the
@@ -109,19 +171,20 @@ class AuditLog:
         everything after that point is unverifiable regardless of whether it
         was itself altered."""
         with self._connect() as conn:
+            meta_row = conn.execute("SELECT trusted_genesis_hash FROM audit_chain_meta WHERE id = 1").fetchone()
             rows = conn.execute(
-                "SELECT id, request_id, ts, user_id, role, event_type, payload, prev_hash, entry_hash "
+                "SELECT id, request_id, ts, user_id, role, tenant_id, event_type, payload, prev_hash, entry_hash "
                 "FROM audit_events ORDER BY rowid",
             ).fetchall()
 
-        expected_prev = GENESIS_HASH
+        expected_prev = meta_row[0] if meta_row else GENESIS_HASH
         for row in rows:
-            event_id, request_id, ts, user_id, role, event_type, payload_json, stored_prev, stored_entry = row
+            event_id, request_id, ts, user_id, role, tenant_id, event_type, payload_json, stored_prev, stored_entry = row
             if stored_prev != expected_prev:
                 return False, event_id
             recomputed = _compute_entry_hash(
                 stored_prev, event_id=event_id, request_id=request_id, ts=ts,
-                user_id=user_id, role=role, event_type=event_type, payload_json=payload_json,
+                user_id=user_id, role=role, tenant_id=tenant_id, event_type=event_type, payload_json=payload_json,
             )
             if recomputed != stored_entry:
                 return False, event_id
@@ -130,7 +193,7 @@ class AuditLog:
 
 
 def _row_to_dict(row) -> dict:
-    keys = ["id", "request_id", "ts", "user_id", "role", "event_type", "payload"]
+    keys = ["id", "request_id", "ts", "user_id", "role", "tenant_id", "event_type", "payload"]
     record = dict(zip(keys, row))
     record["payload"] = json.loads(record["payload"])
     return record

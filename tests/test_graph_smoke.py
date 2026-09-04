@@ -106,13 +106,19 @@ def test_bulk_phi_export_can_be_rejected():
     assert "blocked by a human reviewer" in final["final_answer"]
 
 
-def test_admin_auto_approves_bulk_export_without_interrupt():
+def test_admin_high_risk_request_also_requires_approval():
+    # No role bypasses review above low risk - not even admin. Auto-release
+    # is reserved for low-risk content; who may *review* someone else's
+    # request is a separate axis (permissions.can_review_approvals).
     app = _fresh_app()
-    _, result = run_request(
+    request_id, result = run_request(
         app,
         query="What are the requirements for exporting raw patient-identifiable claims data?",
         user_id="tester", role="admin",
     )
-    assert "__interrupt__" not in result
+    assert "__interrupt__" in result
     assert result["guardrail_risk"] == "high"
-    assert result["final_answer"] == result["draft_answer"]
+
+    final = resume_request(app, request_id=request_id, approved=True, approver="another_admin")
+    assert final["approval_status"] == "approved"
+    assert final["final_answer"] == final["draft_answer"]

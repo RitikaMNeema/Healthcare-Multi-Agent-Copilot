@@ -9,9 +9,9 @@ from copilot.agents import critic as critic_agent
 from copilot.agents import executor as executor_agent
 from copilot.agents import planner as planner_agent
 from copilot.config import default_checkpoint_db_path
-from copilot.governance import permissions
 from copilot.governance.approvals import ApprovalQueue
 from copilot.governance.audit import AuditLog
+from copilot.governance.redaction import redact_text
 from copilot.guardrails.citation_check import verify_citations
 from copilot.guardrails.input_guardrails import check_input
 from copilot.guardrails.output_guardrails import scan_output
@@ -52,7 +52,7 @@ def build_graph(
             verdict = check_input(state["query"])
             audit.log(
                 request_id=state["request_id"], event_type="input_guardrail",
-                user_id=state["user_id"], role=state["role"], payload=verdict,
+                user_id=state["user_id"], role=state["role"], tenant_id=state.get("tenant_id"), payload=verdict,
             )
             return {"blocked": verdict["blocked"], "block_reason": verdict["reason"]}
 
@@ -62,7 +62,8 @@ def build_graph(
     def node_blocked(state: CopilotState) -> dict:
         audit.log(
             request_id=state["request_id"], event_type="blocked",
-            user_id=state["user_id"], role=state["role"], payload={"reason": state.get("block_reason")},
+            user_id=state["user_id"], role=state["role"], tenant_id=state.get("tenant_id"),
+            payload={"reason": state.get("block_reason")},
         )
         return {"final_answer": f"I can't help with that request. Reason: {state.get('block_reason')}"}
 
@@ -71,7 +72,7 @@ def build_graph(
             result, used_model = planner_agent.plan(llm, state["query"])
             audit.log(
                 request_id=state["request_id"], event_type="plan_created",
-                user_id=state["user_id"], role=state["role"],
+                user_id=state["user_id"], role=state["role"], tenant_id=state.get("tenant_id"),
                 payload={"task_type": result.task_type, "steps": result.steps, "model": used_model},
             )
             return {"task_type": result.task_type, "plan_steps": result.steps, "used_model": used_model}
@@ -81,11 +82,12 @@ def build_graph(
             result = executor_agent.execute(
                 llm, query=state["query"], role=state["role"], request_id=state["request_id"],
                 user_id=state["user_id"], audit=audit, tracing=tracing,
+                task_type=state.get("task_type"), plan_steps=state.get("plan_steps"),
             )
             audit.log(
                 request_id=state["request_id"], event_type="draft_answer",
-                user_id=state["user_id"], role=state["role"],
-                payload={"model": result.used_model, "tools_used": result.tools_used},
+                user_id=state["user_id"], role=state["role"], tenant_id=state.get("tenant_id"),
+                payload={"model": result.used_model, "tools_used": result.tools_used, "plan_followed": result.plan_followed},
             )
             return {
                 "draft_answer": result.answer,
@@ -111,30 +113,49 @@ def build_graph(
             final_risk = max(risks, key=lambda r: _RISK_ORDER[r])
             issues = list(dict.fromkeys(static_issues + verdict.issues + citation_issues))  # de-dupe, preserve order
             requires_approval = final_risk != "low" or verdict.requires_approval
+            # Issues can quote fragments of the draft answer (e.g. "contains
+            # banned phrase: ...") - redact before this ever reaches storage.
+            redacted_issues = [redact_text(issue) for issue in issues]
             audit.log(
                 request_id=state["request_id"], event_type="guardrail_verdict",
-                user_id=state["user_id"], role=state["role"],
-                payload={"risk": final_risk, "issues": issues, "requires_approval": requires_approval},
+                user_id=state["user_id"], role=state["role"], tenant_id=state.get("tenant_id"),
+                payload={"risk": final_risk, "issue_count": len(issues), "issues": redacted_issues,
+                         "requires_approval": requires_approval},
             )
             return {"guardrail_risk": final_risk, "guardrail_issues": issues, "requires_approval": requires_approval}
 
     def route_after_critic(state: CopilotState) -> str:
-        if state.get("requires_approval") and not permissions.can_auto_approve(state["role"]):
-            return "needs_approval"
-        return "finalize"
+        # No role bypasses review above low risk - not even admin. Auto-release
+        # is reserved for content the guardrails classified as low risk;
+        # everything else needs a reviewer who isn't the requester (enforced
+        # in api/server.py, since that's where identity is actually verified).
+        return "needs_approval" if state.get("requires_approval") else "finalize"
 
     def node_request_approval(state: CopilotState) -> dict:
         # Runs exactly once, before the pausing node - `interrupt()` re-executes
         # everything earlier in *its own* node on resume, so any one-time side
         # effect (submitting the pending-approval record, logging the request)
         # has to live here instead, or it would be double-recorded on resume.
+        #
+        # The stored summary is sanitized - never the draft answer or patient
+        # data - since a reviewer's queue listing shouldn't leak sensitive
+        # content to anyone who can merely list pending items. A reviewer who
+        # is actually authorized to decide sees the real draft through the
+        # graph's own checkpoint state (api/server.py's approval-detail
+        # endpoint), not through this table.
+        sanitized_summary = (
+            f"{state.get('task_type', 'request')} via {', '.join(state.get('tools_used', []) or ['no tools'])} "
+            f"- risk={state.get('guardrail_risk')}, {len(state.get('guardrail_issues', []))} guardrail issue(s)"
+        )
         approvals.submit(
-            state["request_id"], summary=state["draft_answer"][:280],
+            state["request_id"], summary=sanitized_summary,
             risk=state.get("guardrail_risk", "medium"), requester_user_id=state["user_id"],
+            tenant_id=state.get("tenant_id"),
         )
         audit.log(
             request_id=state["request_id"], event_type="approval_requested",
-            user_id=state["user_id"], role=state["role"], payload={"risk": state.get("guardrail_risk")},
+            user_id=state["user_id"], role=state["role"], tenant_id=state.get("tenant_id"),
+            payload={"risk": state.get("guardrail_risk")},
         )
         return {}
 
@@ -152,7 +173,8 @@ def build_graph(
             approvals.decide(state["request_id"], approver=approver, approved=approved)
             audit.log(
                 request_id=state["request_id"], event_type="approval_decided",
-                user_id=state["user_id"], role=state["role"], payload={"approved": approved, "approver": approver},
+                user_id=state["user_id"], role=state["role"], tenant_id=state.get("tenant_id"),
+                payload={"approved": approved, "approver": approver},
             )
 
             if approved:
@@ -166,7 +188,8 @@ def build_graph(
         final = state.get("final_answer") or state.get("draft_answer", "")
         audit.log(
             request_id=state["request_id"], event_type="finalized",
-            user_id=state["user_id"], role=state["role"], payload={"final_answer_preview": final[:280]},
+            user_id=state["user_id"], role=state["role"], tenant_id=state.get("tenant_id"),
+            payload={"final_answer_length": len(final)},
         )
         return {"final_answer": final}
 
@@ -193,10 +216,13 @@ def build_graph(
     return graph.compile(checkpointer=checkpointer)
 
 
-def run_request(app, *, query: str, user_id: str, role: str, request_id: str | None = None) -> tuple[str, dict]:
+def run_request(app, *, query: str, user_id: str, role: str, request_id: str | None = None,
+                 tenant_id: str | None = None) -> tuple[str, dict]:
     request_id = request_id or str(uuid.uuid4())
     config = {"configurable": {"thread_id": request_id}}
-    initial_state = {"request_id": request_id, "user_id": user_id, "role": role, "query": query}
+    initial_state = {
+        "request_id": request_id, "user_id": user_id, "role": role, "tenant_id": tenant_id, "query": query,
+    }
     result = app.invoke(initial_state, config=config)
     return request_id, result
 
