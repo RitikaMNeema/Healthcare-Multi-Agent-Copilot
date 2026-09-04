@@ -160,6 +160,10 @@ def approval_detail(request_id: str, identity: Identity = Depends(require_review
         "risk": snapshot.values.get("guardrail_risk"),
         "issues": snapshot.values.get("guardrail_issues"),
         "tools_used": snapshot.values.get("tools_used"),
+        "recommended_action": snapshot.values.get("recommended_action"),
+        "policy_violations": snapshot.values.get("policy_violations"),
+        "unsupported_claims": snapshot.values.get("unsupported_claims"),
+        "supported_claims": snapshot.values.get("supported_claims"),
     }
 
 

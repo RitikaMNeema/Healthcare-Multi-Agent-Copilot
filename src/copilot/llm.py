@@ -315,8 +315,44 @@ class MockBackend:
             match = re.search(r"Draft answer to review:\n\n(.*)", text, re.S)
             draft = match.group(1) if match else text
             risk, issues = scan_output(draft)
+            policy_violations = [issue for issue in issues if "banned phrase" in issue or "PII" in issue]
+            recommended_action = "block" if risk == "high" else ("revise" if risk == "medium" else "release")
             return schema(risk=risk, issues=issues, requires_approval=(risk != "low"),
-                          rationale="mock backend: static keyword/PII heuristic scan")
+                          rationale="mock backend: static keyword/PII heuristic scan",
+                          policy_violations=policy_violations, recommended_action=recommended_action)
+
+        if name == "ClaimVerificationResult":
+            from copilot.guardrails.claim_verification import ClaimFinding
+
+            draft_match = re.search(r"Draft answer:\n(.*)", text, re.S)
+            draft = draft_match.group(1) if draft_match else text
+            evidence_match = re.search(r"Evidence retrieved this turn:\n(.*?)\n\nDraft answer:", text, re.S)
+            evidence_text = evidence_match.group(1) if evidence_match else ""
+            evidence_tokens = set(tokenize(evidence_text))
+
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", draft) if s.strip()]
+            findings = []
+            for sentence in sentences:
+                sentence_tokens = set(tokenize(sentence))
+                if not sentence_tokens:
+                    continue
+                if not evidence_tokens:
+                    verdict, rationale = "insufficient_evidence", "mock backend: no evidence was retrieved this turn"
+                else:
+                    overlap = len(sentence_tokens & evidence_tokens) / len(sentence_tokens)
+                    if overlap > 0.4:
+                        verdict = "supported"
+                        rationale = f"mock backend: {overlap:.0%} token overlap with retrieved evidence"
+                    else:
+                        # A keyword-overlap heuristic can positively confirm support but can't
+                        # reliably detect contradiction - that needs real semantic judgment,
+                        # which only the real backend provides. Defaulting the "can't confirm"
+                        # case to insufficient_evidence (never a fabricated "contradicted") keeps
+                        # the mock honest about what it can actually determine.
+                        verdict = "insufficient_evidence"
+                        rationale = f"mock backend: only {overlap:.0%} token overlap with retrieved evidence"
+                findings.append(ClaimFinding(claim=sentence, verdict=verdict, rationale=rationale))
+            return schema(findings=findings)
 
         if name == "JudgeVerdict":
             match = re.search(r"Criteria for a good answer: (.*?)\n\nCopilot's answer:\n(.*)", text, re.S)
@@ -371,9 +407,9 @@ class MockBackend:
                 "query claims records, explain a specific claim's denial, compute aggregate denial metrics, "
                 "and - for admins - build a remediation plan for a denial pattern. Access is role-based: "
                 "viewers get policy search and aggregate metrics only, operators can also query individual "
-                "claims and denials, and admins can additionally generate remediation plans and auto-approve "
-                "their own high-risk requests. Anything flagged medium or high risk is held for human review "
-                "unless your role is allowed to auto-approve it."
+                "claims and denials, and admins can additionally generate remediation plans. Anything flagged "
+                "medium or high risk is held for review by an authorized reviewer who is not the requester, "
+                "regardless of role - no role auto-approves its own request."
             )
             return FakeMessage(content=[Block(type="text", text=text)], stop_reason="end_turn")
 

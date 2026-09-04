@@ -228,7 +228,13 @@ def test_reviewer_detail_endpoint_shows_full_content(api):
     request_id = _submit_high_risk(client, keys["bob"])
     resp = client.get(f"/approvals/{request_id}/detail", headers=headers(keys["eve"]))
     assert resp.status_code == 200
-    assert resp.json()["draft_answer"]
+    body = resp.json()
+    assert body["draft_answer"]
+    # Grounding fields (critic + claim-verification findings) reach the
+    # reviewer, not just risk/issues - a reviewer deciding on a high-risk
+    # request should see *why* the critic flagged it.
+    for field in ("recommended_action", "policy_violations", "unsupported_claims", "supported_claims"):
+        assert field in body
 
 
 def test_non_reviewer_cannot_hit_detail_endpoint(api):

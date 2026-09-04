@@ -38,6 +38,7 @@ class ExecutionResult:
     tools_used: list[str] = field(default_factory=list)
     evidence_claim_ids: list[str] = field(default_factory=list)
     evidence_doc_sources: list[str] = field(default_factory=list)
+    evidence_text: list[str] = field(default_factory=list)
     plan_followed: bool | None = None  # None when task_type has no single expected tool (e.g. "general")
 
 
@@ -110,3 +111,41 @@ def _record_evidence(result: ExecutionResult, tool_name: str, tool_result: objec
         result.evidence_doc_sources.extend(hit["source"] for hit in tool_result if "source" in hit)
     if tool_name == "create_remediation_plan" and isinstance(tool_result, dict):
         result.evidence_doc_sources.extend(tool_result.get("policy_references", []))
+
+    snippet = _evidence_text_for(tool_name, tool_result)
+    if snippet:
+        result.evidence_text.append(snippet)
+
+
+# The model already saw this exact content as a tool result this same turn
+# (it's what the answer was generated from) - rendering it again here for the
+# critic/claim-verifier isn't a new disclosure, just a second internal LLM
+# call over the same information within the same request.
+def _evidence_text_for(tool_name: str, tool_result: object) -> str | None:
+    if tool_name == "search_payer_policy" and isinstance(tool_result, list):
+        return "\n".join(f"[{hit['source']}]: {hit['text']}" for hit in tool_result if "source" in hit)
+
+    if tool_name == "analyze_denial" and isinstance(tool_result, dict):
+        if tool_result.get("denial_code") is None:
+            return f"Claim {tool_result.get('claim_id')}: status={tool_result.get('status')}, not denied."
+        return (
+            f"Claim {tool_result.get('claim_id')}: payer={tool_result.get('payer')}, "
+            f"procedure={tool_result.get('procedure_code')}, denial_code={tool_result.get('denial_code')} "
+            f"({tool_result.get('denial_code_meaning')}), appealable={tool_result.get('is_appealable')}, "
+            f"appeal_filed={tool_result.get('appeal_filed')}, appeal_outcome={tool_result.get('appeal_outcome')}, "
+            f"recommended_actions={tool_result.get('recommended_actions')}"
+        )
+
+    if tool_name == "query_claims" and isinstance(tool_result, dict):
+        rows = tool_result.get("claims", [])
+        row_desc = "; ".join(
+            f"{c.get('claim_id')} (status={c.get('status')}, denial_code={c.get('denial_code')})" for c in rows
+        )
+        return (
+            f"query_claims: {tool_result.get('total_matching_count')} matching, "
+            f"showing {tool_result.get('returned_count')}: {row_desc}"
+        )
+
+    if isinstance(tool_result, (dict, list)):
+        return f"{tool_name}: {str(tool_result)[:800]}"
+    return None

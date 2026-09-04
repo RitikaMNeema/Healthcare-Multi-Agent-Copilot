@@ -12,6 +12,7 @@ from copilot.config import default_checkpoint_db_path
 from copilot.governance.approvals import ApprovalQueue
 from copilot.governance.audit import AuditLog
 from copilot.governance.redaction import redact_text
+from copilot.guardrails import claim_verification
 from copilot.guardrails.citation_check import verify_citations
 from copilot.guardrails.input_guardrails import check_input
 from copilot.guardrails.output_guardrails import scan_output
@@ -95,34 +96,69 @@ def build_graph(
                 "tools_used": result.tools_used,
                 "evidence_claim_ids": result.evidence_claim_ids,
                 "evidence_doc_sources": result.evidence_doc_sources,
+                "evidence_text": result.evidence_text,
+                "plan_followed": result.plan_followed,
             }
 
     def node_critic(state: CopilotState) -> dict:
         with tracing.span("node.critic", request_id=state["request_id"], role=state["role"]):
+            evidence_text = "\n\n".join(state.get("evidence_text", []))
+
             static_risk, static_issues = scan_output(state["draft_answer"])
-            verdict, _ = critic_agent.review(llm, state["draft_answer"])
+            claim_result, _ = claim_verification.verify_claims(
+                llm, draft_answer=state["draft_answer"], evidence_text=evidence_text,
+            )
+            claim_summary = claim_verification.summarize(claim_result)
+            unsupported_claims = claim_summary["contradicted_claims"] + claim_summary["insufficient_evidence_claims"]
+
+            verdict, _ = critic_agent.review(
+                llm, question=state["query"], task_type=state.get("task_type"), plan_steps=state.get("plan_steps"),
+                evidence_text=evidence_text, draft_answer=state["draft_answer"], claim_result=claim_result,
+            )
             citation_issues = verify_citations(
                 state["draft_answer"],
                 evidence_doc_sources=set(state.get("evidence_doc_sources", [])),
                 evidence_claim_ids=set(state.get("evidence_claim_ids", [])),
             )
-            # An unverified citation is itself at least a medium-risk finding - a
-            # plausible-looking but ungrounded document or claim reference is
-            # exactly the kind of thing that should stop for human review.
-            risks = [static_risk, verdict.risk] + (["medium"] if citation_issues else [])
+            # An unverified citation, an unsupported claim, or a critic-recommended
+            # block are each independently at least a medium-risk finding (block
+            # forces high) - a plausible-looking but ungrounded answer is exactly
+            # the kind of thing that should stop for human review even if the
+            # critic's own `risk` field under-called it.
+            risks = [static_risk, verdict.risk]
+            if citation_issues or unsupported_claims:
+                risks.append("medium")
+            if verdict.recommended_action == "block":
+                risks.append("high")
             final_risk = max(risks, key=lambda r: _RISK_ORDER[r])
-            issues = list(dict.fromkeys(static_issues + verdict.issues + citation_issues))  # de-dupe, preserve order
+            issues = list(dict.fromkeys(
+                static_issues + verdict.issues + citation_issues
+                + [f"unsupported claim: {c}" for c in unsupported_claims],
+            ))  # de-dupe, preserve order
             requires_approval = final_risk != "low" or verdict.requires_approval
-            # Issues can quote fragments of the draft answer (e.g. "contains
-            # banned phrase: ...") - redact before this ever reaches storage.
-            redacted_issues = [redact_text(issue) for issue in issues]
+            # Issues/claims can quote fragments of the draft answer (e.g. "contains
+            # banned phrase: ...") - redact before any of this reaches the audit
+            # log. Graph *state* (returned below) deliberately keeps the raw text,
+            # consistent with draft_answer/evidence_text already living there
+            # unredacted - state is what an authorized reviewer reads in full via
+            # the approval-detail endpoint, whereas the audit log is a durable,
+            # more broadly-queryable record that data minimization applies to.
             audit.log(
                 request_id=state["request_id"], event_type="guardrail_verdict",
                 user_id=state["user_id"], role=state["role"], tenant_id=state.get("tenant_id"),
-                payload={"risk": final_risk, "issue_count": len(issues), "issues": redacted_issues,
-                         "requires_approval": requires_approval},
+                payload={
+                    "risk": final_risk, "issue_count": len(issues), "issues": [redact_text(i) for i in issues],
+                    "requires_approval": requires_approval, "recommended_action": verdict.recommended_action,
+                    "policy_violations": [redact_text(v) for v in verdict.policy_violations],
+                    "supported_claim_count": len(claim_summary["supported_claims"]),
+                    "unsupported_claim_count": len(unsupported_claims),
+                },
             )
-            return {"guardrail_risk": final_risk, "guardrail_issues": issues, "requires_approval": requires_approval}
+            return {
+                "guardrail_risk": final_risk, "guardrail_issues": issues, "requires_approval": requires_approval,
+                "supported_claims": claim_summary["supported_claims"], "unsupported_claims": unsupported_claims,
+                "policy_violations": verdict.policy_violations, "recommended_action": verdict.recommended_action,
+            }
 
     def route_after_critic(state: CopilotState) -> str:
         # No role bypasses review above low risk - not even admin. Auto-release

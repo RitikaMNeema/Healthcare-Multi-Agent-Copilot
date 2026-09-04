@@ -19,10 +19,16 @@ class CopilotState(TypedDict, total=False):
     tools_used: list[str]
     evidence_claim_ids: list[str]
     evidence_doc_sources: list[str]
+    evidence_text: list[str]
+    plan_followed: bool | None
 
     guardrail_risk: str
     guardrail_issues: list[str]
     requires_approval: bool
+    supported_claims: list[str]
+    unsupported_claims: list[str]
+    policy_violations: list[str]
+    recommended_action: str
 
     approval_status: str
     final_answer: str

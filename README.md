@@ -2,9 +2,10 @@
 
 A LangGraph-orchestrated, multi-agent copilot for healthcare payer/claims denial
 management: planning and tool-calling agents, hybrid BM25/vector RAG with
-claim-level citation verification, guardrails, human-in-the-loop approval, an
-eval harness with a golden dataset and LLM-as-judge, and an audit/permissions
-layer for HIPAA-flavored enterprise governance.
+citation provenance checking and LLM-based claim-level grounding verification,
+guardrails, human-in-the-loop approval, an eval harness with a golden dataset
+and LLM-as-judge, and an audit/permissions layer for HIPAA-flavored enterprise
+governance.
 
 Runs entirely offline against a deterministic mock LLM backend when no
 `ANTHROPIC_API_KEY` is set - the whole pipeline, test suite, and eval harness
@@ -23,7 +24,8 @@ script (`data/generate_claims.py`) - nothing in this repo is real PHI.
 | **Retrieval benchmark** (Recall@k/MRR, proves the embedding swap helped) | `eval/retrieval_benchmark.py` |
 | **Synthetic claims database** (520 claims, seeded/reproducible) | `data/generate_claims.py`, `data/claims.db` |
 | Guardrails (input + output, static + LLM-judged) | `src/copilot/guardrails/` |
-| **Claim-level citation verification** | `src/copilot/guardrails/citation_check.py` |
+| **Citation provenance check** (a cited doc/claim ID was actually retrieved this turn) | `src/copilot/guardrails/citation_check.py` |
+| **Claim-level grounding verification** (each factual claim classified supported/contradicted/insufficient_evidence against retrieved evidence) | `src/copilot/guardrails/claim_verification.py` |
 | Human-in-the-loop approval (LangGraph `interrupt`/`Command`) | `src/copilot/graph.py` (`request_approval` / `await_approval` nodes) |
 | State management (durable, cross-process checkpointing) | SQLite-backed `langgraph` checkpointer, see `graph.py` |
 | Fallback logic (retry + model fallback) | `src/copilot/fallback.py` |
@@ -68,13 +70,18 @@ meanings) that both the retriever and the eval suite check against exactly.
 
 This mirrors the HIPAA minimum-necessary principle: viewers get policy text
 and aggregates only; operators can do individual-claim casework; admins can
-additionally generate cross-payer remediation plans and auto-approve their
-own high-risk requests. A tool is never *offered* to a role that can't use
-it, and `tools/registry.invoke_tool` re-checks permission at execution time
-regardless - two independent layers, so a bug in either can't become a
-privilege escalation. `query_claims` takes typed filters, never a raw SQL
-string, for the same "don't let the model touch a real interpreter directly"
-reason the calculator used an AST allowlist in an earlier version of this
+additionally generate cross-payer remediation plans. A fifth role,
+`compliance_officer`, has minimal tool access of its own (`search_payer_policy`
+only) but is one of the two roles (with `admin`) authorized to review pending
+approvals - reviewing and doing casework are deliberately separate
+permissions, not a side effect of being an admin. No role auto-approves its
+own high-risk request; see "Security" below. A tool is never *offered* to a
+role that can't use it, and `tools/registry.invoke_tool` re-checks permission
+at execution time regardless - two independent layers, so a bug in either
+can't become a privilege escalation. `query_claims` takes typed filters, never
+a raw SQL string, for the same "don't let the model touch a real interpreter
+directly" reason the calculator used an AST allowlist in an earlier version
+of this
 project - it's both safer and more realistic (production text-to-SQL systems
 very rarely expose a raw execution tool).
 
@@ -100,12 +107,18 @@ input_guard --(blocked)--> blocked --> END
 
 `execute` runs a manual tool-calling loop (see `agents/executor.py`) - the
 model chooses among the five tools each turn based on the query, there is no
-automatic RAG injection. `critic` merges three signals into one risk score: a
-static regex/PII scan, an LLM-judged safety verdict, and citation
-verification (below); if the combined risk isn't "low", the request is routed
-to a human approval gate *unless* the requester's role can auto-approve.
-Approval state is checkpointed to SQLite, so a paused request survives a CLI
-process exiting or an API server restart.
+automatic RAG injection; it also receives the planner's `task_type`/steps as
+explicit context, and its `plan_followed` field (audited) records whether it
+actually used the tool that plan called for. `critic` merges four signals
+into one risk score: a static regex/PII scan, an LLM-judged safety verdict
+(given the original question, the plan, the retrieved evidence, and the
+claim-grounding findings below - not just the draft answer in isolation), a
+citation provenance check, and claim-level grounding verification (see
+"Citation provenance vs. claim-level grounding" below); if the combined risk isn't "low", the request is always
+routed to a human approval gate - no role, including admin, auto-approves its
+own request above low risk (see "Security" below). Approval state is
+checkpointed to SQLite, so a paused request survives a CLI process exiting or
+an API server restart.
 
 ## Hybrid retrieval
 
@@ -170,19 +183,40 @@ lookups ("CO-16" vs. "CO-50" vs. "CO-97") in a way a 30-query benchmark on a
 30-chunk corpus doesn't fully stress-test - a benefit worth stating rather
 than silently discarding in favor of the single best number.
 
-## Citation verification
+## Citation provenance vs. claim-level grounding
 
-Every draft answer can cite a policy document (`[filename.md]`) or a specific
-claim (`CLM-000123`). `guardrails/citation_check.py` checks each citation
-against what the executor's tool calls *actually returned this turn*
-(`evidence_doc_sources`, `evidence_claim_ids` on the graph state) - an
-unverified citation (a plausible-looking but ungrounded reference) is treated
-as at least medium risk. The mock LLM backend is faithful by construction (it
-only ever cites what a tool call returned), so the golden dataset's citation
-cases verify *correct* citations are recognized as clean; the hallucination-
-detection path itself is covered directly in `tests/test_guardrails.py`
-against fabricated citation text, which is a more reliable way to prove that
-path works than waiting for a mock to misbehave.
+These are two different checks, deliberately not conflated:
+
+**Citation provenance** (`guardrails/citation_check.py`): every draft answer
+can cite a policy document (`[filename.md]`) or a specific claim
+(`CLM-000123`). This checks each citation *token* against what the executor's
+tool calls actually returned this turn (`evidence_doc_sources`,
+`evidence_claim_ids` on the graph state) - an unverified citation (a
+plausible-looking but ungrounded reference) is treated as at least medium
+risk. It says nothing about whether the sentence attached to a valid citation
+is actually true of that document - an answer can cite a real, retrieved
+policy while still misstating what it says. The mock LLM backend is faithful
+by construction (it only ever cites what a tool call returned), so the golden
+dataset's citation cases verify *correct* citations are recognized as clean;
+the hallucination-detection path itself is covered directly in
+`tests/test_guardrails.py` against fabricated citation text.
+
+**Claim-level grounding** (`guardrails/claim_verification.py`): a separate LLM
+call breaks the draft answer into its individual factual claims and
+classifies each one - `supported`, `contradicted`, or `insufficient_evidence`
+- against the evidence text actually retrieved this turn, independent of
+whether the sentence happens to carry a citation token at all. This is what
+"claim-level verification" should actually mean, and is a real (if imperfect)
+entailment check rather than a string-matching heuristic; `graph.py`'s
+`node_critic` feeds these findings to the critic as context and, as a hard
+safety net independent of the critic's own judgment, forces at least medium
+risk whenever any claim comes back contradicted or insufficient_evidence -
+see `tests/test_critic_grounding.py`, which verifies this escalation fires
+even when a stubbed critic verdict itself says "low risk, no approval needed."
+Both checks are heuristic-bounded: citation provenance only catches a
+fabricated *token*, and claim grounding is only as reliable as the underlying
+model's entailment judgment on the evidence given - neither is an infallible
+filter that makes human review of a flagged answer unnecessary.
 
 ## Observability
 
@@ -220,35 +254,92 @@ response to what the tracing showed, not a guess.
 ## Security
 
 **Server-verified identity, not a client-supplied claim.** The FastAPI layer
-originally took `role` and `user_id` as request-body fields - meaning any
-caller could send `"role": "admin"` and bypass RBAC entirely, which quietly
-made the whole permissions story unenforceable over a network. Every
-endpoint now requires an `X-API-Key` header resolved server-side to a fixed
-`(user_id, role)` via `governance/identity.py`; `role`/`user_id` are no
-longer accepted from the client at all. Keys are stored as SHA-256 hashes
+never takes `role`, `user_id`, or `tenant_id` as request-body fields - a JSON
+field is just a claim (any caller could send `"role": "admin"`), while an
+identity resolved server-side from an API key is a fact. Every endpoint
+requires an `X-API-Key` header resolved via `governance/identity.py` to a
+fixed `(user_id, role, tenant_id)`. Keys are stored as SHA-256 hashes
 (`data/api_keys.json`), never plaintext - `generate_api_key()` returns a raw
-key exactly once, at mint time, and persists only its hash. A real
-deployment points `COPILOT_API_KEYS_FILE` at its own, non-committed file; the
-committed one holds four fixed, intentionally public demo keys so the
+key exactly once, at mint time, and persists only its hash. A real deployment
+points `COPILOT_API_KEYS_FILE` at its own, non-committed file; the committed
+one holds six fixed, intentionally public demo keys (two tenants) so the
 project is easy to try locally (documented above, not a real secret store).
 
-**Separation of duties on approvals.** `ApprovalQueue` now records which
-identity submitted a high-risk request (`requester_user_id`); the approval
-endpoint rejects (403) an attempt to approve or reject a request from the
-same identity that triggered it. This closes the obvious gap in a
-self-approval design: the human-in-the-loop gate is only meaningful if the
-human can't be the same actor as the one being reviewed.
+**A dedicated approver role, checked on both identity and role.** Being
+authenticated is not the same as being authorized to review someone else's
+request. A new `compliance_officer` role (alongside `admin`) is authorized to
+list or decide on pending approvals via `permissions.can_review_approvals` -
+`GET /approvals`, `GET /approvals/{id}/detail`, and `POST /approvals/{id}`
+403 any caller whose role isn't one of those two, not just a viewer or
+operator but any role that isn't a designated reviewer. Separately,
+`ApprovalQueue` records which identity submitted a request
+(`requester_user_id`); the decision endpoint 403s an attempt to approve or
+reject a request from that same identity, admin included. Both checks run
+independently, so neither alone is sufficient - a compliance officer still
+can't approve their own request, and an admin still can't approve someone
+else's request just by virtue of role if a future change ever tried to add a
+same-identity exception.
 
-**Tamper-evident audit log.** Each `AuditLog.log()` call now hash-chains its
-entry to the previous one (`prev_hash` + canonical JSON of its own fields ->
-`entry_hash`, the same construction as a git commit chain) via
-`AuditLog.verify_chain()`. This doesn't stop someone with direct database
-access from rewriting the whole chain forward from a tampered row - no local
-hash chain can, without an external anchor - but it makes a *partial, silent*
-edit detectable, which is the property that actually matters for an audit
-trail: `tests/test_security.py` verifies both a tampered payload and a
-deleted row are caught. `GET /audit/verify` (admin only) exposes this over
-the API.
+**No role auto-approves above low risk.** `route_after_critic` routes purely
+on the guardrail risk classification - "low" releases automatically,
+anything else always goes to human review, independent of who submitted it.
+An earlier version of this let `admin` bypass review for its own high-risk
+requests (PHI export, bulk operations); that bypass has been removed
+entirely, not just narrowed - see `tests/test_graph_smoke.py`'s
+`test_admin_high_risk_request_also_requires_approval`.
+
+**Data minimization in the audit log and approval queue.** Audit events no
+longer store raw tool inputs/outputs, retrieved documents, or generated-answer
+content: `governance/redaction.py` hashes patient identifiers and redacts
+SSN/email/phone/MRN/DOB/address patterns from anything bound for storage, a
+`tool_invoked` event stores a result count and a hash of the input rather
+than the input itself, and the `finalized`/`guardrail_verdict` events store a
+length and redacted issue/violation summaries rather than answer content. The
+approval queue stores only a sanitized one-line summary (task type, tools
+used, risk, issue count) - never the draft answer or patient data. An
+authorized reviewer sees the actual content only through
+`GET /approvals/{id}/detail`, which reads it from the graph's own checkpoint
+state on demand and is itself audited (`approval_detail_viewed`) - the
+content exists in exactly one place a reviewer can reach, not duplicated into
+a second, more broadly-queryable table.
+
+**Atomic approval decisions.** `ApprovalQueue.decide()` is a single
+`UPDATE ... WHERE status = 'pending'`, not an unconditional update - if two
+reviewers race to decide the same request, the loser's write affects zero
+rows and the API returns `409 Conflict` rather than silently overwriting the
+first decision (`tests/test_api_server.py`'s
+`test_simultaneous_approval_attempts_second_gets_409`). `submit()` uses a
+plain `INSERT`, never `INSERT OR REPLACE`, so a duplicate `request_id` fails
+loudly instead of quietly resetting an existing decision.
+
+**Tenant isolation.** Every identity, audit event, and approval-queue row
+carries a `tenant_id`. `GET /audit/{request_id}` and the approval endpoints
+check it, returning 404 (never revealing that a cross-tenant request even
+exists) rather than 403 for a request outside the caller's tenant -
+`tests/test_api_server.py` includes a caller from a second demo tenant
+(`frank`, tenant-b) to verify this holds even for a same-role caller.
+
+**Tamper-evident, concurrency-safe audit log.** Each `AuditLog.log()` call
+hash-chains its entry to the previous one (`prev_hash` + canonical JSON of
+its own fields -> `entry_hash`, the same construction as a git commit chain).
+The read-last-hash-then-insert sequence runs inside a single `BEGIN
+IMMEDIATE` transaction, so two concurrent writers can't both read the same
+"last hash" and fork the chain - `tests/test_security.py`'s
+`test_audit_chain_survives_concurrent_writers` spins up 8 threads writing
+concurrently and verifies the chain afterward; it reliably fails against the
+unsynchronized version of this code and passes against the fix.
+`verify_chain()` doesn't stop someone with direct database access from
+rewriting the whole chain forward from a tampered row - no local hash chain
+can, without an external anchor - but it makes a *partial, silent* edit
+detectable, which is the property that actually matters for an audit trail:
+the same test file verifies both a tampered payload and a deleted row are
+caught. `GET /audit/verify` (admin or compliance_officer) exposes this over
+the API. `AuditLog.purge_older_than()` implements retention deletion
+(recording a new trusted checkpoint hash so a *sanctioned* purge doesn't
+itself look like tampering); a real deployment should archive purged rows
+before deleting, per its own retention policy, and record who viewed audit
+data - this project logs an `audit_viewed` event on every `GET
+/audit/{request_id}` call as a starting point for that.
 
 **Rate limiting.** A per-identity fixed-window limiter
 (`governance/rate_limit.py`, 30 requests/minute by default) protects every
@@ -258,12 +349,13 @@ for a Redis-backed limiter behind a load balancer without touching call
 sites.
 
 **What's still out of scope, deliberately.** Real secrets management (a
-vault, KMS-backed encryption at rest), TLS termination, and actual HIPAA
-certification are infrastructure and compliance-process concerns a demo
-project doesn't own - the security work here is about making the RBAC and
-approval *logic* actually hold up against a network client that doesn't play
-along, not about standing up the surrounding infrastructure a real regulated
-deployment would need.
+vault, KMS-backed encryption at rest for the SQLite files themselves), TLS
+termination, and actual HIPAA certification are infrastructure and
+compliance-process concerns a demo project doesn't own - the security work
+here is about making the RBAC, approval, and data-minimization *logic*
+actually hold up against a network client that doesn't play along, not about
+standing up the surrounding infrastructure a real regulated deployment would
+need.
 
 ## Setup
 
@@ -302,24 +394,37 @@ python -m copilot.cli pending
 python -m copilot.cli approve --request-id <id> --approver carol --decision approve
 python -m copilot.cli audit --request-id <id>
 
-# Same request as an admin - admins can auto-approve their own high-risk requests
+# Same high-risk request submitted as an admin - still requires independent
+# review by someone else; no role auto-approves its own request (see Security)
 python -m copilot.cli chat --query "..." --role admin --user dave
 ```
 
+The CLI talks to the graph directly (no HTTP layer, no resolved API-key
+identity), so it does not itself enforce reviewer-role or
+separation-of-duties checks - `approve --approver <anyone>` is trusted local
+input, the same way a `psql` shell trusts whoever is sitting at it. Those
+checks are enforced at the actual trust boundary: the API server (below).
+
 ### API server
 
-Every endpoint requires an `X-API-Key` header - `role` and `user_id` are
-never accepted as request fields (see [Security](#security)). Four demo
-keys ship in `data/api_keys.json` (hashed at rest; these raw values are
-intentionally public for trying the project locally - never reuse this
+Every endpoint requires an `X-API-Key` header - `role`, `user_id`, and
+`tenant_id` are never accepted as request fields (see [Security](#security)).
+Six demo keys ship in `data/api_keys.json` (hashed at rest; these raw values
+are intentionally public for trying the project locally - never reuse this
 pattern for real credentials):
 
 | Key | Identity |
 |---|---|
-| `demo-viewer-key-alice` | alice / viewer |
-| `demo-operator-key-bob` | bob / operator |
-| `demo-operator-key-carol` | carol / operator |
-| `demo-admin-key-dave` | dave / admin |
+| `demo-viewer-key-alice` | alice / viewer / tenant-a |
+| `demo-operator-key-bob` | bob / operator / tenant-a |
+| `demo-operator-key-carol` | carol / operator / tenant-a |
+| `demo-admin-key-dave` | dave / admin / tenant-a |
+| `demo-compliance-key-eve` | eve / compliance_officer / tenant-a |
+| `demo-operator-key-frank` | frank / operator / **tenant-b** (for testing tenant isolation) |
+
+Only `admin` and `compliance_officer` may list or decide on pending
+approvals - carol (an operator) would get a 403 from every endpoint below;
+so would bob, since the requester can never approve their own request:
 
 ```bash
 uvicorn api.server:app --reload
@@ -327,13 +432,17 @@ uvicorn api.server:app --reload
 curl -X POST localhost:8000/chat -H "X-API-Key: demo-operator-key-bob" \
   -H "Content-Type: application/json" -d '{"query": "Why was claim CLM-000039 denied?"}'
 
-# high-risk request from bob -> pending_approval; carol (a different identity) approves it
-curl -X POST localhost:8000/approvals/<request_id> -H "X-API-Key: demo-operator-key-carol" \
+# high-risk request from bob -> pending_approval; eve (compliance_officer, not the
+# requester) reviews the sanitized queue entry, reads the full draft via the
+# detail endpoint, then decides
+curl localhost:8000/approvals -H "X-API-Key: demo-compliance-key-eve"
+curl localhost:8000/approvals/<request_id>/detail -H "X-API-Key: demo-compliance-key-eve"
+curl -X POST localhost:8000/approvals/<request_id> -H "X-API-Key: demo-compliance-key-eve" \
   -H "Content-Type: application/json" -d '{"approved": true}'
 
-curl localhost:8000/approvals -H "X-API-Key: demo-operator-key-carol"
-curl localhost:8000/audit/<request_id> -H "X-API-Key: demo-operator-key-carol"
-curl localhost:8000/audit/verify -H "X-API-Key: demo-admin-key-dave"   # admin only
+curl localhost:8000/chat/<request_id> -H "X-API-Key: demo-operator-key-bob"   # bob polls his own result
+curl localhost:8000/audit/<request_id> -H "X-API-Key: demo-operator-key-bob"  # owner can view
+curl localhost:8000/audit/verify -H "X-API-Key: demo-admin-key-dave"          # admin or compliance_officer only
 ```
 
 ### Docker
@@ -380,17 +489,25 @@ concurrent writers (Postgres) rather than continuing to tune SQLite pragmas.
 pytest -q
 ```
 
-62 tests cover: the five tools directly against known ground truth in the
+95 tests cover: the five tools directly against known ground truth in the
 synthetic claims DB; permission enforcement (including that a denied tool
-call is itself audited); input/output guardrails and citation verification
-(including hallucination detection); the hybrid retriever's ranking and its
+call is itself audited); input/output guardrails, citation provenance
+checking (including hallucination detection), and claim-level grounding
+(`test_claim_verification.py`, `test_critic_grounding.py` - including that an
+unsupported/contradicted claim forces review even when a stubbed critic
+verdict itself says "low risk"); the hybrid retriever's ranking and its
 stopword/relative-cutoff regressions; a retrieval-benchmark regression
 (hybrid must not score below BM25-only on paraphrases); tracing/cost-calculation
-correctness; API-key hashing, rate limiting, and audit-chain tamper detection
-(a modified payload and a deleted row are both caught); and full graph smoke
-tests across every task type, the human-in-the-loop pause/resume/reject
-paths, and the admin-vs-operator approval-routing split on an identical
-high-risk query.
+correctness; API-key hashing, rate limiting, audit-chain tamper detection (a
+modified payload and a deleted row are both caught), and audit-chain
+concurrency safety (8 threads writing simultaneously, chain verified after);
+a full FastAPI integration suite (`test_api_server.py`, 20+ cases) covering
+reviewer-role gating, separation of duties, atomic 409-on-race approval
+decisions, owner/reviewer/tenant-scoped audit access, tenant isolation, data
+minimization in API responses, and rate-limit enforcement; and full graph
+smoke tests across every task type and the human-in-the-loop pause/resume/
+reject paths, including that a high-risk request from an admin still
+requires approval from someone else.
 
 ## Eval harness
 
@@ -441,4 +558,6 @@ change to prompts, guardrails, tools, or agent logic.
   three-method interface as the real Claude backend (`llm.py`), including its
   own regex-based tool-selection/parameter-extraction logic and a keyword-
   overlap judge, so the entire agent graph, guardrail routing, citation
-  verification, and eval harness are exercised deterministically offline.
+  provenance/claim-grounding checks, and eval harness are exercised
+  deterministically offline (its claim-grounding heuristic is honest about
+  its own limits - see `test_verify_claims_never_fabricates_contradicted_in_mock`).

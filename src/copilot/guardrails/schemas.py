@@ -13,3 +13,5 @@ class GuardrailVerdict(BaseModel):
     issues: list[str]
     requires_approval: bool
     rationale: str
+    policy_violations: list[str] = Field(default_factory=list)
+    recommended_action: Literal["release", "revise", "block"] = "release"

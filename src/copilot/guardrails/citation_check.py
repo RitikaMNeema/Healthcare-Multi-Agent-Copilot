@@ -1,10 +1,14 @@
-"""Claim-level and document-level citation verification.
+"""Citation *provenance* validation - not claim-level semantic verification.
 
 A draft answer can cite a policy document (`[filename.md]`) or a specific
-claim (`CLM-000123`). This checks every such citation actually corresponds to
-something a tool call surfaced *this turn* - catching a hallucinated citation
-(a plausible-looking claim ID or filename the model invented rather than
-retrieved) before it reaches the guardrail risk score.
+claim (`CLM-000123`). This checks only that every such citation *token*
+actually corresponds to something a tool call surfaced this turn - catching a
+hallucinated citation (a plausible-looking claim ID or filename the model
+invented rather than retrieved). It says nothing about whether the sentence
+attached to a valid citation is actually true of that document or claim - an
+answer can cite a real, retrieved policy while still misstating what it says.
+For that, see `guardrails/claim_verification.py`, which classifies each
+individual factual claim against the retrieved evidence text itself.
 """
 import re
 
