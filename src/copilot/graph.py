@@ -115,6 +115,12 @@ def build_graph(
             )
             claim_summary = claim_verification.summarize(claim_result)
             unsupported_claims = claim_summary["contradicted_claims"] + claim_summary["insufficient_evidence_claims"]
+            # A deterministic, LLM-independent floor check: zero findings for
+            # a substantive draft answer means verification didn't engage
+            # with it at all, not that everything is clean - failing open
+            # here would mean a completely unverified answer sails through
+            # with no signal whatsoever.
+            coverage_gap = claim_verification.has_coverage_gap(state["draft_answer"], claim_result)
 
             verdict, _ = critic_agent.review(
                 llm, question=state["query"], task_type=state.get("task_type"), plan_steps=state.get("plan_steps"),
@@ -125,23 +131,27 @@ def build_graph(
                 evidence_doc_sources=set(state.get("evidence_doc_sources", [])),
                 evidence_claim_ids=set(state.get("evidence_claim_ids", [])),
             )
-            # An unverified citation or an unsupported claim is each independently
-            # at least a medium-risk finding - a plausible-looking but ungrounded
-            # answer is exactly the kind of thing that should stop for human
-            # review even if the critic's own `risk` field under-called it. A
-            # critic-recommended "block" is reported as high risk here for
-            # audit/reporting purposes, but routing around approval entirely
-            # (see route_after_critic) - not the risk score - is what actually
+            # An unverified citation, an unsupported claim, or a coverage gap
+            # (verification not engaging with the answer at all) is each
+            # independently at least a medium-risk finding - a plausible-
+            # looking but ungrounded (or unchecked) answer is exactly the
+            # kind of thing that should stop for human review even if the
+            # critic's own `risk` field under-called it. A critic-recommended
+            # "block" is reported as high risk here for audit/reporting
+            # purposes, but routing around approval entirely (see
+            # route_after_critic) - not the risk score - is what actually
             # keeps a block from being releasable by a reviewer.
             risks = [static_risk, verdict.risk]
-            if citation_issues or unsupported_claims:
+            if citation_issues or unsupported_claims or coverage_gap:
                 risks.append("medium")
             if verdict.recommended_action == "block":
                 risks.append("high")
             final_risk = max(risks, key=lambda r: _RISK_ORDER[r])
             issues = list(dict.fromkeys(
                 static_issues + verdict.issues + citation_issues
-                + [f"unsupported claim: {c}" for c in unsupported_claims],
+                + [f"unsupported claim: {c}" for c in unsupported_claims]
+                + (["claim verification returned no findings for a non-trivial answer (coverage gap)"]
+                   if coverage_gap else []),
             ))  # de-dupe, preserve order
             requires_approval = final_risk != "low" or verdict.requires_approval
             # Issues/claims can quote fragments of the draft answer (e.g. "contains
@@ -160,6 +170,7 @@ def build_graph(
                     "policy_violations": [redact_text(v) for v in verdict.policy_violations],
                     "supported_claim_count": len(claim_summary["supported_claims"]),
                     "unsupported_claim_count": len(unsupported_claims),
+                    "coverage_gap": coverage_gap,
                 },
             )
             return {
@@ -201,6 +212,7 @@ def build_graph(
             },
         )
         return {
+            "blocked": True,
             "approval_status": "blocked_by_critic",
             "final_answer": "This response was blocked by the safety critic and cannot be released, "
                              "including by human approval.",
@@ -212,11 +224,19 @@ def build_graph(
         # runs before, and independent of, the risk-based approval gate below.
         if state.get("recommended_action") == "block":
             return "blocked_by_critic"
-        # "revise" gets a bounded number of automated fix-it attempts before
-        # falling back to requiring a human - never looped forever, and never
-        # silently released just because revision attempts ran out.
-        if state.get("recommended_action") == "revise" and state.get("revision_count", 0) < MAX_REVISIONS:
-            return "revise"
+        if state.get("recommended_action") == "revise":
+            # Bounded automated fix-it attempts - never looped forever.
+            if state.get("revision_count", 0) < MAX_REVISIONS:
+                return "revise"
+            # Revisions exhausted and the critic *still* isn't recommending
+            # release: this must always go to a human, full stop - it must
+            # NOT fall through to the ordinary risk check below. If the model
+            # inconsistently paired "revise" with risk="low"/
+            # requires_approval=False (a real possibility - these are
+            # separate fields from the same LLM call, not guaranteed
+            # internally consistent), falling through would finalize and
+            # release an answer the critic never actually approved.
+            return "needs_approval"
         # No role bypasses review above low risk - not even admin. Auto-release
         # is reserved for content the guardrails classified as low risk;
         # everything else needs a reviewer who isn't the requester (enforced

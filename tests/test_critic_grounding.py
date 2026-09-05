@@ -104,6 +104,23 @@ def test_critic_recommended_block_is_terminal_not_sent_for_approval():
     assert result["final_answer"] != result["draft_answer"]  # the draft itself is never released
 
 
+def test_blocked_by_critic_sets_the_blocked_flag():
+    # approval_status="blocked_by_critic" alone isn't enough - any consumer
+    # (the API, the CLI, a future caller) that checks the general-purpose
+    # `blocked` flag - the same one input-guard blocks set - must also see a
+    # critic block, or it can misreport a refused request as "completed".
+    stub = StubLLM(
+        claim_findings=[ClaimFinding(claim="x", verdict="supported", rationale="ok")],
+        guardrail_verdict=GuardrailVerdict(
+            risk="low", issues=[], requires_approval=False, rationale="benign on its face",
+            recommended_action="block",
+        ),
+    )
+    app = _fresh_app(stub)
+    _, result = run_request(app, query="Some request", user_id="u1", role="operator")
+    assert result["blocked"] is True
+
+
 def test_a_blocked_request_cannot_be_released_by_resuming_it():
     # Defense in depth: even if something tried to resume a blocked_by_critic
     # request as though it were pending approval, there is no await_approval
@@ -141,6 +158,51 @@ def test_revise_loops_back_through_critic_then_falls_back_to_approval():
     # forever, and the outcome falls back to human review rather than ever
     # silently releasing an answer the critic never approved.
     assert result["revision_count"] == 2
+    assert "__interrupt__" in result
+
+
+def test_exhausted_revisions_always_requires_approval_even_if_verdict_says_low_risk():
+    # risk/requires_approval and recommended_action come from the same LLM
+    # call but are separate fields - nothing guarantees they're internally
+    # consistent. If the critic keeps saying "revise" while (inconsistently)
+    # also reporting risk="low"/requires_approval=False, exhausting the
+    # revision budget must still force human review - it must never fall
+    # through to the ordinary risk check and finalize an answer the critic
+    # never actually recommended releasing.
+    stub = StubLLM(
+        claim_findings=[ClaimFinding(claim="x", verdict="supported", rationale="ok")],
+        guardrail_verdict=GuardrailVerdict(
+            risk="low", issues=[], requires_approval=False, rationale="inconsistent verdict",
+            recommended_action="revise",
+        ),
+        draft_answer="An answer that keeps needing revision.",
+    )
+    app = _fresh_app(stub)
+    _, result = run_request(app, query="Some request", user_id="u1", role="operator")
+
+    assert result["revision_count"] == 2
+    assert "__interrupt__" in result  # never silently finalized
+    assert result.get("final_answer") is None  # finalize never ran
+
+
+def test_empty_claim_findings_for_substantive_answer_forces_review():
+    # Fail-closed, not fail-open: an empty findings list from the claim
+    # verifier must not be read as "everything is supported" - it can also
+    # mean verification silently didn't engage with the answer at all. The
+    # deterministic coverage-gap check (independent of this same stub LLM)
+    # catches that and forces review even though the critic itself is
+    # (inconsistently) reporting low risk.
+    stub = StubLLM(
+        claim_findings=[],  # verifier returned nothing, despite a substantive draft
+        guardrail_verdict=GuardrailVerdict(risk="low", issues=[], requires_approval=False, rationale="looks fine"),
+        draft_answer="Aetna requires prior authorization for CPT 97110 after the second visit in a plan year.",
+    )
+    app = _fresh_app(stub)
+    _, result = run_request(app, query="What does Aetna require?", user_id="u1", role="operator")
+
+    assert result["guardrail_risk"] != "low"
+    assert result["requires_approval"] is True
+    assert any("coverage gap" in issue for issue in result["guardrail_issues"])
     assert "__interrupt__" in result
 
 

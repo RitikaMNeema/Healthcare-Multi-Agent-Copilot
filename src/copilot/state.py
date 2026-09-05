@@ -25,7 +25,7 @@ class CopilotState(TypedDict, total=False):
     guardrail_risk: str
     guardrail_issues: list[str]
     requires_approval: bool
-    supported_claims: list[str]
+    supported_claims: list[dict]  # [{"claim": str, "evidence_refs": list[str]}, ...]
     unsupported_claims: list[str]
     policy_violations: list[str]
     recommended_action: str

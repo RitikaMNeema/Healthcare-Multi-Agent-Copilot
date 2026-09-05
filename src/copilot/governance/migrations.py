@@ -112,6 +112,26 @@ def _m2_tenancy_and_chain_meta(conn: sqlite3.Connection) -> None:
         )
 
 
+def _m3_explicit_hash_version(conn: sqlite3.Connection) -> None:
+    # Migration 2's legacy_hash_boundary_rowid inferred a row's hash algorithm
+    # from its position (rowid) relative to a recorded cutoff - which breaks
+    # if the table is ever fully emptied (by purge_older_than() reaching every
+    # row) and SQLite reuses low rowids for subsequent inserts: a brand-new,
+    # v2-hashed row could land at a rowid <= the old boundary and get wrongly
+    # verified with the v1 algorithm. An explicit, immutable column on each
+    # row sidesteps rowid reuse entirely - a row's hash_version travels with
+    # the row itself, never inferred from where it happens to sit in the table.
+    _add_column_if_missing(conn, "audit_events", "hash_version", "INTEGER")
+
+    meta_row = conn.execute("SELECT legacy_hash_boundary_rowid FROM audit_chain_meta WHERE id = 1").fetchone()
+    boundary = meta_row[0] if meta_row else 0
+    # One-time backfill using the boundary this migration is retiring - every
+    # row is stamped permanently here; nothing after this reads the boundary
+    # to decide a hash algorithm again.
+    conn.execute("UPDATE audit_events SET hash_version = 1 WHERE rowid <= ? AND hash_version IS NULL", (boundary,))
+    conn.execute("UPDATE audit_events SET hash_version = 2 WHERE hash_version IS NULL")
+
+
 # (version, description, migration function) - append-only. Never edit an
 # already-shipped entry's behavior after it's been applied anywhere; add a
 # new, later-numbered migration instead, the same rule as any other
@@ -119,6 +139,7 @@ def _m2_tenancy_and_chain_meta(conn: sqlite3.Connection) -> None:
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "create audit_events and pending_approvals base tables", _m1_initial_schema),
     (2, "add tenant_id to audit_events/pending_approvals, add audit_chain_meta", _m2_tenancy_and_chain_meta),
+    (3, "add explicit per-row hash_version column, retiring rowid-boundary inference", _m3_explicit_hash_version),
 ]
 
 

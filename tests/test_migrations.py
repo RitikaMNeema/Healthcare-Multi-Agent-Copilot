@@ -6,6 +6,7 @@ against a table that already exists - hence the explicit, versioned
 migrations in `governance/migrations.py`.
 """
 import sqlite3
+import time
 
 from copilot.governance.approvals import ApprovalQueue
 from copilot.governance.audit import AuditLog, _compute_entry_hash_v1
@@ -100,6 +101,36 @@ def test_tampering_a_legacy_row_is_still_detected_after_migration(tmp_path):
     assert broken_id == "e1"
 
 
+def test_purge_to_empty_then_new_write_is_not_misverified_as_legacy(tmp_path):
+    # The exact reported edge case: SQLite reuses low rowids once a table is
+    # completely emptied. If hash-algorithm choice were still inferred from
+    # "rowid <= legacy_hash_boundary_rowid", a new v2-hashed row landing at a
+    # reused low rowid would be wrongly checked with the v1 algorithm and
+    # fail verification even though nothing was tampered. The explicit,
+    # permanent hash_version column (migration 3) makes this impossible by
+    # construction - a row's version is stamped once, at write time, not
+    # inferred from its position.
+    db_path = str(tmp_path / "legacy_audit.db")
+    _create_pre_tenant_database(db_path)
+    audit = AuditLog(db_path=db_path)  # migrates; legacy row 'e1' gets hash_version=1
+
+    purged = audit.purge_older_than(cutoff_ts=time.time() + 1)  # purges every row, including 'e1'
+    assert purged == 1
+
+    with audit._connect() as conn:
+        remaining = conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+    assert remaining == 0  # table is now empty - next INSERT can reuse rowid 1
+
+    audit.log(request_id="r2", event_type="new_event", tenant_id="tenant-a", payload={})
+
+    is_valid, broken_id = audit.verify_chain()
+    assert is_valid is True, f"false tamper report at {broken_id} - new row misverified with the wrong algorithm"
+
+    with audit._connect() as conn:
+        stored_version = conn.execute("SELECT hash_version FROM audit_events WHERE request_id = 'r2'").fetchone()[0]
+    assert stored_version == 2
+
+
 def test_approvalqueue_upgrades_a_pre_tenant_database_without_error(tmp_path):
     db_path = str(tmp_path / "legacy_approvals.db")
     _create_pre_tenant_database(db_path)
@@ -128,7 +159,7 @@ def test_apply_migrations_is_idempotent(tmp_path):
     first = apply_migrations(conn)
     second = apply_migrations(conn)
     conn.close()
-    assert first == [1, 2]
+    assert first == [1, 2, 3]
     assert second == []  # nothing left to apply
 
 
@@ -141,10 +172,10 @@ def test_migrations_recorded_and_shared_across_auditlog_and_approvalqueue(tmp_pa
     conn = sqlite3.connect(db_path)
     applied_versions = {row[0] for row in conn.execute("SELECT version FROM schema_migrations").fetchall()}
     conn.close()
-    assert applied_versions == {1, 2}
+    assert applied_versions == {1, 2, 3}
 
     ApprovalQueue(db_path=db_path)  # must not raise, must not duplicate migration rows
     conn = sqlite3.connect(db_path)
     count = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
     conn.close()
-    assert count == 2
+    assert count == 3

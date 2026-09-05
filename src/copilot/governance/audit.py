@@ -10,6 +10,7 @@ from copilot.governance.migrations import apply_migrations
 from copilot.sqlite_utils import connect as sqlite_connect
 
 GENESIS_HASH = "0" * 64
+CURRENT_HASH_VERSION = 2
 
 
 def _compute_entry_hash_v1(prev_hash: str, *, event_id: str, request_id: str, ts: float,
@@ -99,9 +100,10 @@ class AuditLog:
             )
             conn.execute(
                 "INSERT INTO audit_events "
-                "(id, request_id, ts, user_id, role, tenant_id, event_type, payload, prev_hash, entry_hash) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (event_id, request_id, ts, user_id, role, tenant_id, event_type, payload_json, prev_hash, entry_hash),
+                "(id, request_id, ts, user_id, role, tenant_id, event_type, payload, prev_hash, entry_hash, hash_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (event_id, request_id, ts, user_id, role, tenant_id, event_type, payload_json, prev_hash, entry_hash,
+                 CURRENT_HASH_VERSION),
             )
             conn.execute("COMMIT")
         except Exception:
@@ -164,30 +166,31 @@ class AuditLog:
         everything after that point is unverifiable regardless of whether it
         was itself altered.
 
-        Rows at or before `legacy_hash_boundary_rowid` (set once, at
-        migration time - see migrations.py) predate tenant_id and are
-        verified with the original pre-tenancy algorithm; everything after
-        uses the current one. Without this split, every database that has
-        ever been migrated would recompute a different hash than what a
-        legacy row was actually stored with and get flagged as 100% tampered
-        - a false alarm, not a real one."""
+        Each row's own `hash_version` column (stamped once, permanently, at
+        write time - see migration 3) says which algorithm actually produced
+        its hash; verification never infers this from position (e.g. a
+        rowid vs. a recorded boundary), because SQLite reuses low rowids once
+        a table is fully emptied - inferring hash algorithm from rowid would
+        mean a brand-new row could land at a rowid a purge had previously
+        assigned to a legacy row and get checked with the wrong algorithm.
+        Without a per-row version, every database that has ever been migrated
+        would also recompute a different hash than what a legacy row was
+        actually stored with and get flagged as 100% tampered - a false
+        alarm, not a real one."""
         with self._connect() as conn:
-            meta_row = conn.execute(
-                "SELECT trusted_genesis_hash, legacy_hash_boundary_rowid FROM audit_chain_meta WHERE id = 1",
-            ).fetchone()
+            meta_row = conn.execute("SELECT trusted_genesis_hash FROM audit_chain_meta WHERE id = 1").fetchone()
             rows = conn.execute(
-                "SELECT rowid, id, request_id, ts, user_id, role, tenant_id, event_type, payload, prev_hash, entry_hash "
-                "FROM audit_events ORDER BY rowid",
+                "SELECT id, request_id, ts, user_id, role, tenant_id, event_type, payload, prev_hash, entry_hash, "
+                "hash_version FROM audit_events ORDER BY rowid",
             ).fetchall()
 
         expected_prev = meta_row[0] if meta_row else GENESIS_HASH
-        legacy_boundary = meta_row[1] if meta_row else 0
         for row in rows:
-            (rowid, event_id, request_id, ts, user_id, role, tenant_id, event_type, payload_json,
-             stored_prev, stored_entry) = row
+            (event_id, request_id, ts, user_id, role, tenant_id, event_type, payload_json,
+             stored_prev, stored_entry, hash_version) = row
             if stored_prev != expected_prev:
                 return False, event_id
-            if rowid <= legacy_boundary:
+            if hash_version == 1:
                 recomputed = _compute_entry_hash_v1(
                     stored_prev, event_id=event_id, request_id=request_id, ts=ts,
                     user_id=user_id, role=role, event_type=event_type, payload_json=payload_json,

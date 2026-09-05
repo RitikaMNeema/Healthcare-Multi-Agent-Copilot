@@ -129,16 +129,31 @@ risk score - decides which:
 - **`block`**: unconditional and terminal (`blocked_by_critic` -> `END`). A
   human reviewer is never even offered the chance to release it - there is no
   path from this node to a released answer, by construction, not by
-  convention. (An earlier version folded "block" into "high risk" and routed
-  it through the normal approval gate, meaning a reviewer's *approve* could
-  still release blocked content - see `tests/test_critic_grounding.py`'s
+  convention. `blocked_by_critic` also sets the same `blocked` flag an
+  input-guard block sets (not just `approval_status="blocked_by_critic"`),
+  since every consumer that decides what to show a caller - `api/server.py`'s
+  `/chat` and `/chat/{id}` included - checks that one flag; an earlier
+  version set only `approval_status`, so the API reported a critic-blocked
+  request as `status="completed"` with the refusal text sitting in
+  `final_answer`, indistinguishable from a real answer to anyone not
+  inspecting the field name. (Two regression tests guard this class of bug
+  now: `test_critic_grounding.py`'s
   `test_critic_recommended_block_is_terminal_not_sent_for_approval` for the
-  regression test.)
+  routing, and `test_api_server.py`'s
+  `test_critic_blocked_request_reports_blocked_not_completed` for the API
+  surfacing it correctly.)
 - **`revise`**: loops back to `execute`'s output being rewritten (see
   `agents/executor.py`'s `revise()`) and re-verified by the full critic
   pipeline - claim verification included - not trusted blindly. Capped at
-  `MAX_REVISIONS` attempts, after which it falls through to human review
-  rather than looping forever or giving up and releasing anyway.
+  `MAX_REVISIONS` attempts; once exhausted, routing goes to human review
+  *unconditionally*, never falling through to the ordinary risk-based check.
+  This matters because `risk`/`requires_approval` and `recommended_action`
+  come from the same LLM call but are separate fields with no guaranteed
+  internal consistency - a verdict that keeps saying "revise" while also
+  (inconsistently) reporting `risk="low"`/`requires_approval=False` must
+  still end up in front of a human once the revision budget runs out, not
+  finalize on the strength of the inconsistent risk fields. See
+  `test_exhausted_revisions_always_requires_approval_even_if_verdict_says_low_risk`.
 - **`release`**: the risk-based gate applies as before - if the combined risk
   isn't "low", the request is routed to a human approval gate; no role,
   including admin, auto-approves its own request above low risk (see
@@ -247,14 +262,30 @@ the hallucination-detection path itself is covered directly in
 call breaks the draft answer into its individual factual claims and
 classifies each one - `supported`, `contradicted`, or `insufficient_evidence`
 - against the evidence text actually retrieved this turn, independent of
-whether the sentence happens to carry a citation token at all. This is what
-"claim-level verification" should actually mean, and is a real (if imperfect)
-entailment check rather than a string-matching heuristic; `graph.py`'s
-`node_critic` feeds these findings to the critic as context and, as a hard
-safety net independent of the critic's own judgment, forces at least medium
-risk whenever any claim comes back contradicted or insufficient_evidence -
-see `tests/test_critic_grounding.py`, which verifies this escalation fires
-even when a stubbed critic verdict itself says "low risk, no approval needed."
+whether the sentence happens to carry a citation token at all. A `supported`
+finding also carries `evidence_refs` - which specific document or claim ID
+backs it (e.g. `"prior_authorization_policy.md"`, `"CLM-000123"`) - so a
+"supported" verdict points at something checkable rather than asserting
+support with nothing to verify it against. This is what "claim-level
+verification" should actually mean, and is a real (if imperfect) entailment
+check rather than a string-matching heuristic; `graph.py`'s `node_critic`
+feeds these findings to the critic as context and, as a hard safety net
+independent of the critic's own judgment, forces at least medium risk
+whenever any claim comes back contradicted or insufficient_evidence - see
+`tests/test_critic_grounding.py`, which verifies this escalation fires even
+when a stubbed critic verdict itself says "low risk, no approval needed."
+
+An empty findings list is *not* treated as "everything is supported" - it can
+also mean verification failed to engage with the answer at all (a bad
+response, a schema hiccup, an LLM being lazy), and failing open there would
+let a completely unverified answer through with no signal whatsoever.
+`has_coverage_gap()` is a small, deterministic, LLM-independent sentence
+splitter that only checks *whether* the draft has substantive claim-shaped
+content the verifier should have said something about - never *whether* a
+given finding is correct, which only an entailment-capable model can judge -
+and forces the same medium-risk floor when the verifier returned nothing for
+a non-trivial answer.
+
 Both checks are heuristic-bounded: citation provenance only catches a
 fabricated *token*, and claim grounding is only as reliable as the underlying
 model's entailment judgment on the evidence given - neither is an infallible
@@ -404,11 +435,19 @@ introduced: a pre-migration row's stored `entry_hash` was computed by an
 algorithm that never included `tenant_id` at all, so recomputing it with the
 new algorithm during `verify_chain()` would never match, and every migrated
 database would falsely report 100% of its history as tampered. `audit.py`
-keeps both hash algorithms (`_compute_entry_hash_v1`/`_v2`) and a recorded
-`legacy_hash_boundary_rowid` so each row is verified with whichever algorithm
-actually produced its hash - `tests/test_migrations.py` reproduces a
-pre-tenant-id database, migrates it, and checks both that it upgrades
-without error and that tampering a legacy row is still detected afterward.
+keeps both hash algorithms (`_compute_entry_hash_v1`/`_v2`); which one
+applies to a given row is recorded in an explicit, immutable `hash_version`
+column on the row itself (migration 3) - not inferred from the row's rowid
+relative to a recorded cutoff, which was migration 2's first approach and had
+its own edge case: SQLite reuses low rowids once a table is fully emptied, so
+after `purge_older_than()` removes every row, a brand-new row could land at a
+reused low rowid and get wrongly checked with the legacy algorithm. Stamping
+the version on the row at write time - once, permanently - makes this
+impossible regardless of what purging or rowid reuse happens later.
+`tests/test_migrations.py` reproduces both: a pre-tenant-id database
+upgrading without error (and still detecting tampering in its legacy rows
+afterward), and a full purge-to-empty followed by a new write, checking the
+new row is verified with the current algorithm rather than the legacy one.
 
 **The CLI is a trusted local interface, not a second authorization
 boundary.** The API server resolves identity from an API key and checks
@@ -578,7 +617,7 @@ concurrent writers (Postgres) rather than continuing to tune SQLite pragmas.
 pytest -q
 ```
 
-108 tests cover: the five tools directly against known ground truth in the
+118 tests cover: the five tools directly against known ground truth in the
 synthetic claims DB; permission enforcement (including that a denied tool
 call is itself audited); input/output guardrails, citation provenance
 checking (including hallucination detection), and claim-level grounding

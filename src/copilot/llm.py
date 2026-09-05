@@ -115,6 +115,23 @@ class FakeMessage:
 
 
 _GREETING_RE = re.compile(r"^\s*(hi|hello|hey)\b", re.I)
+_CITATION_TAG_RE = re.compile(r"\[([^\]]+)\]")
+_CLAIM_ID_RE = re.compile(r"\bCLM-\d{6}\b", re.I)
+
+
+def _evidence_ref_for_line(line: str) -> str | None:
+    """Best-effort extraction of *what* in an evidence line identifies it -
+    a `[source.md]` citation tag for policy excerpts, or a claim ID for
+    claims-data evidence - so a mock "supported" finding can point at a
+    concrete evidence_ref rather than just asserting support with nothing to
+    check it against."""
+    tag_match = _CITATION_TAG_RE.search(line)
+    if tag_match:
+        return tag_match.group(1)
+    claim_match = _CLAIM_ID_RE.search(line)
+    if claim_match:
+        return claim_match.group(0)
+    return None
 
 PAYER_NAMES = ["BlueCross BlueShield", "UnitedHealthcare", "Medicare", "Aetna"]
 _PAYER_RE = re.compile("|".join(re.escape(p) for p in PAYER_NAMES), re.I)
@@ -334,7 +351,11 @@ class MockBackend:
             draft = draft_match.group(1) if draft_match else text
             evidence_match = re.search(r"Evidence retrieved this turn:\n(.*?)\n\nDraft answer:", text, re.S)
             evidence_text = evidence_match.group(1) if evidence_match else ""
-            evidence_tokens = set(tokenize(evidence_text))
+            # Per-line, not whole-blob, overlap - lets the mock identify *which*
+            # evidence line best matches a claim, so it can attach a concrete
+            # evidence_ref (a citation tag or claim ID) rather than just a
+            # yes/no verdict.
+            evidence_lines = [line for line in evidence_text.split("\n") if line.strip()]
 
             sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", draft) if s.strip()]
             findings = []
@@ -342,22 +363,35 @@ class MockBackend:
                 sentence_tokens = set(tokenize(sentence))
                 if not sentence_tokens:
                     continue
-                if not evidence_tokens:
-                    verdict, rationale = "insufficient_evidence", "mock backend: no evidence was retrieved this turn"
+                if not evidence_lines:
+                    findings.append(ClaimFinding(
+                        claim=sentence, verdict="insufficient_evidence",
+                        rationale="mock backend: no evidence was retrieved this turn",
+                    ))
+                    continue
+
+                best_line, best_overlap = "", 0.0
+                for line in evidence_lines:
+                    overlap = len(sentence_tokens & set(tokenize(line))) / len(sentence_tokens)
+                    if overlap > best_overlap:
+                        best_line, best_overlap = line, overlap
+
+                if best_overlap > 0.4:
+                    findings.append(ClaimFinding(
+                        claim=sentence, verdict="supported",
+                        rationale=f"mock backend: {best_overlap:.0%} token overlap with retrieved evidence",
+                        evidence_refs=[_evidence_ref_for_line(best_line)] if _evidence_ref_for_line(best_line) else [],
+                    ))
                 else:
-                    overlap = len(sentence_tokens & evidence_tokens) / len(sentence_tokens)
-                    if overlap > 0.4:
-                        verdict = "supported"
-                        rationale = f"mock backend: {overlap:.0%} token overlap with retrieved evidence"
-                    else:
-                        # A keyword-overlap heuristic can positively confirm support but can't
-                        # reliably detect contradiction - that needs real semantic judgment,
-                        # which only the real backend provides. Defaulting the "can't confirm"
-                        # case to insufficient_evidence (never a fabricated "contradicted") keeps
-                        # the mock honest about what it can actually determine.
-                        verdict = "insufficient_evidence"
-                        rationale = f"mock backend: only {overlap:.0%} token overlap with retrieved evidence"
-                findings.append(ClaimFinding(claim=sentence, verdict=verdict, rationale=rationale))
+                    # A keyword-overlap heuristic can positively confirm support but can't
+                    # reliably detect contradiction - that needs real semantic judgment,
+                    # which only the real backend provides. Defaulting the "can't confirm"
+                    # case to insufficient_evidence (never a fabricated "contradicted") keeps
+                    # the mock honest about what it can actually determine.
+                    findings.append(ClaimFinding(
+                        claim=sentence, verdict="insufficient_evidence",
+                        rationale=f"mock backend: only {best_overlap:.0%} token overlap with retrieved evidence",
+                    ))
             return schema(findings=findings)
 
         if name == "JudgeVerdict":

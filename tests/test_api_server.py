@@ -10,17 +10,19 @@ import pytest
 from fastapi.testclient import TestClient
 
 from copilot.governance.identity import generate_api_key
+from copilot.guardrails.claim_verification import ClaimFinding, ClaimVerificationResult
+from copilot.guardrails.schemas import GuardrailVerdict, PlannerOutput
+from copilot.llm import Block, FakeMessage
 
 
-@pytest.fixture
-def api(tmp_path, monkeypatch):
+def _setup_keys(tmp_path, monkeypatch):
     keys_path = tmp_path / "api_keys.json"
     monkeypatch.setenv("COPILOT_API_KEYS_FILE", str(keys_path))
     monkeypatch.setenv("COPILOT_AUDIT_DB", str(tmp_path / "audit.db"))
     monkeypatch.setenv("COPILOT_CHECKPOINT_DB", str(tmp_path / "checkpoints.db"))
     monkeypatch.setenv("COPILOT_TRACE_LOG", str(tmp_path / "traces.jsonl"))
 
-    keys = {
+    return {
         "alice": generate_api_key("alice", "viewer", "tenant-a", path=str(keys_path)),
         "bob": generate_api_key("bob", "operator", "tenant-a", path=str(keys_path)),
         "carol": generate_api_key("carol", "operator", "tenant-a", path=str(keys_path)),
@@ -28,6 +30,45 @@ def api(tmp_path, monkeypatch):
         "eve": generate_api_key("eve", "compliance_officer", "tenant-a", path=str(keys_path)),
         "frank": generate_api_key("frank", "operator", "tenant-b", path=str(keys_path)),
     }
+
+
+@pytest.fixture
+def api(tmp_path, monkeypatch):
+    keys = _setup_keys(tmp_path, monkeypatch)
+
+    sys.modules.pop("api.server", None)
+    import api.server as server_module
+
+    importlib.reload(server_module)
+    return TestClient(server_module.app), keys
+
+
+class _AlwaysBlockStubLLM:
+    """Deterministically produces a critic verdict of recommended_action=
+    "block", regardless of query - used to test that the API surfaces a
+    critic-level block correctly (status="blocked"), independent of whatever
+    the shared MockBackend's heuristics would classify a given query as."""
+
+    def complete_structured(self, *, system, messages, schema, model=None):
+        if schema is PlannerOutput:
+            return PlannerOutput(task_type="policy_lookup", steps=["answer"])
+        if schema is ClaimVerificationResult:
+            return ClaimVerificationResult(findings=[ClaimFinding(claim="x", verdict="supported", rationale="ok")])
+        if schema is GuardrailVerdict:
+            return GuardrailVerdict(
+                risk="low", issues=[], requires_approval=False, rationale="benign on its face",
+                recommended_action="block",
+            )
+        raise NotImplementedError(schema)
+
+    def complete_with_tools(self, *, system, messages, tools, max_tokens=1024, model=None):
+        return FakeMessage(content=[Block(type="text", text="An answer that gets blocked.")], stop_reason="end_turn")
+
+
+@pytest.fixture
+def api_with_blocking_critic(tmp_path, monkeypatch):
+    keys = _setup_keys(tmp_path, monkeypatch)
+    monkeypatch.setattr("copilot.graph.get_backend", lambda tracing=None: _AlwaysBlockStubLLM())
 
     sys.modules.pop("api.server", None)
     import api.server as server_module
@@ -205,6 +246,33 @@ def test_tenant_isolation_on_approval_queue(api):
 
 
 # --- data minimization ---------------------------------------------------
+
+# --- critic-level blocks ---------------------------------------------------
+
+def test_critic_blocked_request_reports_blocked_not_completed(api_with_blocking_critic):
+    # The exact bug this test guards against: node_blocked_by_critic used to
+    # set approval_status="blocked_by_critic" but not the general-purpose
+    # `blocked` flag, and /chat only checked `blocked` - so a critic-refused
+    # request came back as status="completed" with the refusal text sitting
+    # in final_answer, indistinguishable from a real answer to a caller.
+    client, keys = api_with_blocking_critic
+    resp = client.post("/chat", json={"query": "Anything"}, headers=headers(keys["bob"]))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "blocked"
+    assert body["status"] != "completed"
+    assert "blocked" in body["final_answer"].lower()
+
+
+def test_critic_blocked_request_status_poll_also_reports_blocked(api_with_blocking_critic):
+    client, keys = api_with_blocking_critic
+    resp = client.post("/chat", json={"query": "Anything"}, headers=headers(keys["bob"]))
+    request_id = resp.json()["request_id"]
+
+    status_resp = client.get(f"/chat/{request_id}", headers=headers(keys["bob"]))
+    assert status_resp.status_code == 200
+    assert status_resp.json()["status"] == "blocked"
+
 
 def test_pending_chat_response_does_not_leak_draft_content(api):
     client, keys = api
