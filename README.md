@@ -32,6 +32,7 @@ script (`data/generate_claims.py`) - nothing in this repo is real PHI.
 | Structured outputs | `src/copilot/guardrails/schemas.py` via `client.messages.parse` |
 | **Eval harness** (30-case golden dataset, regression checks, LLM-as-judge) | `eval/` |
 | **Audit trails** (append-only SQLite log of every decision) | `src/copilot/governance/audit.py` |
+| **Versioned schema migrations** (an existing database upgrades cleanly, never a bare `CREATE TABLE IF NOT EXISTS`) | `src/copilot/governance/migrations.py` |
 | **Permissions / RBAC** (HIPAA minimum-necessary tiers) | `src/copilot/governance/permissions.py`, enforced in `src/copilot/tools/registry.py` |
 | **Observability** (OpenTelemetry tracing, latency + token-cost dashboard) | `src/copilot/observability/` |
 | Production deployment (FastAPI + Docker) | `api/`, `Dockerfile`, `docker-compose.yml` |
@@ -92,33 +93,74 @@ input_guard --(blocked)--> blocked --> END
      |
    (ok)
      v
-   plan --> execute (tool-calling loop) --> critic --> route_after_critic
-                                                              |
-                                          +-------------------+-------------------+
-                                          |                                       |
-                                   needs_approval                            finalize --> END
-                                          v
-                                 request_approval (log once)
-                                          v
-                                 await_approval (interrupt, resumable)
-                                          v
-                                      finalize --> END
+   plan --> execute (tool-calling loop) --> critic <--------------------+
+                                                |                       |
+                                       route_after_critic                revise
+                                                |                       ^
+                        +--------------+--------+---------+             |
+                        |              |                  |             |
+                 blocked_by_critic   revise*        needs_approval   finalize
+                        |          (loops back)          v
+                       END                        request_approval (log once)
+                                                          v
+                                                 await_approval (interrupt, resumable)
+                                                          v
+                                                       finalize --> END
+
+  * up to MAX_REVISIONS times; beyond that, falls through to needs_approval
+    instead of looping forever or silently releasing an unfixed answer.
 ```
 
 `execute` runs a manual tool-calling loop (see `agents/executor.py`) - the
 model chooses among the five tools each turn based on the query, there is no
 automatic RAG injection; it also receives the planner's `task_type`/steps as
-explicit context, and its `plan_followed` field (audited) records whether it
-actually used the tool that plan called for. `critic` merges four signals
-into one risk score: a static regex/PII scan, an LLM-judged safety verdict
+explicit context (via the system prompt, never the user message - see
+"Why the plan lives in the system prompt" below), and its `plan_followed`
+field (audited) records whether it actually used the tool that plan called
+for. `critic` merges four signals into one risk score and a
+`recommended_action`: a static regex/PII scan, an LLM-judged safety verdict
 (given the original question, the plan, the retrieved evidence, and the
 claim-grounding findings below - not just the draft answer in isolation), a
 citation provenance check, and claim-level grounding verification (see
-"Citation provenance vs. claim-level grounding" below); if the combined risk isn't "low", the request is always
-routed to a human approval gate - no role, including admin, auto-approves its
-own request above low risk (see "Security" below). Approval state is
-checkpointed to SQLite, so a paused request survives a CLI process exiting or
-an API server restart.
+"Citation provenance vs. claim-level grounding" below).
+
+`route_after_critic` branches three ways, and `recommended_action` - not the
+risk score - decides which:
+- **`block`**: unconditional and terminal (`blocked_by_critic` -> `END`). A
+  human reviewer is never even offered the chance to release it - there is no
+  path from this node to a released answer, by construction, not by
+  convention. (An earlier version folded "block" into "high risk" and routed
+  it through the normal approval gate, meaning a reviewer's *approve* could
+  still release blocked content - see `tests/test_critic_grounding.py`'s
+  `test_critic_recommended_block_is_terminal_not_sent_for_approval` for the
+  regression test.)
+- **`revise`**: loops back to `execute`'s output being rewritten (see
+  `agents/executor.py`'s `revise()`) and re-verified by the full critic
+  pipeline - claim verification included - not trusted blindly. Capped at
+  `MAX_REVISIONS` attempts, after which it falls through to human review
+  rather than looping forever or giving up and releasing anyway.
+- **`release`**: the risk-based gate applies as before - if the combined risk
+  isn't "low", the request is routed to a human approval gate; no role,
+  including admin, auto-approves its own request above low risk (see
+  "Security" below).
+
+Approval state is checkpointed to SQLite, so a paused request survives a CLI
+process exiting or an API server restart.
+
+### Why the plan lives in the system prompt
+
+An earlier version prepended the planner's `task_type`/steps directly onto
+the user message the executor sees. This is subtly wrong for a tool-calling
+model: the model (and the mock backend's naive text-extraction) can echo the
+literal user-message text into a tool call's own parameters - e.g.
+`search_payer_policy`'s `query` field - so plan-steering text living there
+pollutes retrieval with unrelated terms instead of just steering which tool
+gets picked. This is exactly what broke the golden-dataset regression gate:
+a HIPAA breach-notification question's search query got diluted with plan
+framing text, pulling in an unrelated policy chunk that happened to contain
+a banned phrase, incorrectly elevating risk. The fix is architectural, not a
+special case: plan context goes in the *system* prompt, which steers the
+model's behavior without ever being mistaken for literal query text.
 
 ## Hybrid retrieval
 
@@ -348,6 +390,43 @@ appropriate at this project's scale, with an interface small enough to swap
 for a Redis-backed limiter behind a load balancer without touching call
 sites.
 
+**Explicit, versioned schema migrations.** `tenant_id` was originally added
+to `audit_events`/`pending_approvals` via `CREATE TABLE IF NOT EXISTS` -
+which only helps a brand-new database; against an already-deployed one it's
+a no-op, so the column was simply missing and the first tenant-scoped query
+against a real, already-running deployment would raise `OperationalError: no
+such column: tenant_id`. `governance/migrations.py` fixes this properly:
+versioned migrations tracked in a `schema_migrations` table, applied in
+order to whatever a database is missing (`ALTER TABLE ... ADD COLUMN` where
+a column needs adding - SQLite has no `ADD COLUMN IF NOT EXISTS`). This
+surfaced a second, subtler bug the same migration would otherwise have
+introduced: a pre-migration row's stored `entry_hash` was computed by an
+algorithm that never included `tenant_id` at all, so recomputing it with the
+new algorithm during `verify_chain()` would never match, and every migrated
+database would falsely report 100% of its history as tampered. `audit.py`
+keeps both hash algorithms (`_compute_entry_hash_v1`/`_v2`) and a recorded
+`legacy_hash_boundary_rowid` so each row is verified with whichever algorithm
+actually produced its hash - `tests/test_migrations.py` reproduces a
+pre-tenant-id database, migrates it, and checks both that it upgrades
+without error and that tampering a legacy row is still detected afterward.
+
+**The CLI is a trusted local interface, not a second authorization
+boundary.** The API server resolves identity from an API key and checks
+reviewer role and separation of duties on every approval decision; the CLI
+(`copilot.cli`) talks to the graph and its SQLite files directly, with no
+identity resolution at all - `--approver <anyone>` used to be accepted and
+passed straight to `resume_request()`, meaning an operator could supply
+someone else's name and approve their own high-risk request through the CLI
+even though the API correctly blocks that exact thing. There is no way to
+bolt real authorization onto this without duplicating the API's identity
+system - anyone who can run the CLI already has direct access to the
+database files it reads and writes, the same way `psql` access implies file
+access. Instead, `cli.py`'s `approve`/`pending` commands now refuse to run
+unless `COPILOT_ALLOW_CLI_APPROVALS=1` is set, and the Dockerfile never sets
+it - so a production container (whose only process is `uvicorn
+api.server:app`) doesn't casually accept CLI-driven approval decisions even
+if someone `docker exec`s in and tries. See "Usage" below and `tests/test_cli.py`.
+
 **What's still out of scope, deliberately.** Real secrets management (a
 vault, KMS-backed encryption at rest for the SQLite files themselves), TLS
 termination, and actual HIPAA certification are infrastructure and
@@ -390,6 +469,8 @@ python -m copilot.cli chat --query "Build a remediation plan for Aetna CO-197 de
 python -m copilot.cli chat --query "What are the requirements for exporting raw patient-identifiable claims data?" --role operator --user bob
 # -> prints a request_id and the pending draft/risk
 
+# approve/pending require an explicit opt-in env var - see below
+export COPILOT_ALLOW_CLI_APPROVALS=1
 python -m copilot.cli pending
 python -m copilot.cli approve --request-id <id> --approver carol --decision approve
 python -m copilot.cli audit --request-id <id>
@@ -399,11 +480,19 @@ python -m copilot.cli audit --request-id <id>
 python -m copilot.cli chat --query "..." --role admin --user dave
 ```
 
-The CLI talks to the graph directly (no HTTP layer, no resolved API-key
-identity), so it does not itself enforce reviewer-role or
-separation-of-duties checks - `approve --approver <anyone>` is trusted local
-input, the same way a `psql` shell trusts whoever is sitting at it. Those
-checks are enforced at the actual trust boundary: the API server (below).
+The CLI talks to the graph and its SQLite files directly - no HTTP layer, no
+resolved API-key identity - so it cannot meaningfully enforce reviewer-role or
+separation-of-duties checks the way the API can: `approve --approver <anyone>`
+is trusted local input, the same way a `psql` shell trusts whoever is sitting
+at it, and someone who can run this CLI already has direct access to the
+underlying database files regardless. Those checks are enforced at the actual
+trust boundary, the API server (below) - the CLI's `approve` and `pending`
+commands additionally refuse to run unless `COPILOT_ALLOW_CLI_APPROVALS=1` is
+set (not real authorization, since anyone who can set an env var and run this
+CLI already has that access - just a deliberate opt-in rather than something
+that works out of the box in whatever environment this module happens to be
+importable in, e.g. inside a production container - see `Dockerfile`, which
+never sets it, and `cli.py`'s module docstring for the full reasoning).
 
 ### API server
 
@@ -489,25 +578,31 @@ concurrent writers (Postgres) rather than continuing to tune SQLite pragmas.
 pytest -q
 ```
 
-95 tests cover: the five tools directly against known ground truth in the
+108 tests cover: the five tools directly against known ground truth in the
 synthetic claims DB; permission enforcement (including that a denied tool
 call is itself audited); input/output guardrails, citation provenance
 checking (including hallucination detection), and claim-level grounding
 (`test_claim_verification.py`, `test_critic_grounding.py` - including that an
 unsupported/contradicted claim forces review even when a stubbed critic
-verdict itself says "low risk"); the hybrid retriever's ranking and its
-stopword/relative-cutoff regressions; a retrieval-benchmark regression
-(hybrid must not score below BM25-only on paraphrases); tracing/cost-calculation
-correctness; API-key hashing, rate limiting, audit-chain tamper detection (a
-modified payload and a deleted row are both caught), and audit-chain
-concurrency safety (8 threads writing simultaneously, chain verified after);
-a full FastAPI integration suite (`test_api_server.py`, 20+ cases) covering
-reviewer-role gating, separation of duties, atomic 409-on-race approval
-decisions, owner/reviewer/tenant-scoped audit access, tenant isolation, data
-minimization in API responses, and rate-limit enforcement; and full graph
-smoke tests across every task type and the human-in-the-loop pause/resume/
-reject paths, including that a high-risk request from an admin still
-requires approval from someone else.
+verdict itself says "low risk", and that a critic-recommended "block" is
+terminal and unconditional rather than something a human reviewer's approve
+can override, or the revise-loop bound by MAX_REVISIONS); the hybrid
+retriever's ranking and its stopword/relative-cutoff regressions; a
+retrieval-benchmark regression (hybrid must not score below BM25-only on
+paraphrases); tracing/cost-calculation correctness; API-key hashing, rate
+limiting, audit-chain tamper detection (a modified payload and a deleted row
+are both caught), audit-chain concurrency safety (8 threads writing
+simultaneously, chain verified after), and schema migrations
+(`test_migrations.py` - a pre-tenant-id database upgrades without error and
+still detects tampering in its legacy rows afterward); a full FastAPI
+integration suite (`test_api_server.py`, 20+ cases) covering reviewer-role
+gating, separation of duties, atomic 409-on-race approval decisions,
+owner/reviewer/tenant-scoped audit access, tenant isolation, data
+minimization in API responses, and rate-limit enforcement; the CLI's
+approval-command gating (`test_cli.py`); and full graph smoke tests across
+every task type and the human-in-the-loop pause/resume/reject paths,
+including that a high-risk request from an admin still requires approval
+from someone else.
 
 ## Eval harness
 

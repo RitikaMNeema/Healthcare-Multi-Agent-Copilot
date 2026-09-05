@@ -315,8 +315,14 @@ class MockBackend:
             match = re.search(r"Draft answer to review:\n\n(.*)", text, re.S)
             draft = match.group(1) if match else text
             risk, issues = scan_output(draft)
-            policy_violations = [issue for issue in issues if "banned phrase" in issue or "PII" in issue]
-            recommended_action = "block" if risk == "high" else ("revise" if risk == "medium" else "release")
+            policy_violations = [issue for issue in issues if "phrase" in issue or "PII" in issue]
+            # Only an actual unsafe-instruction phrase is block-worthy - a
+            # sensitive *topic* (e.g. bulk PHI export) is high risk and always
+            # held for human review, but is legitimately releasable once
+            # reviewed, so it must not be treated the same as content review
+            # can never fix. See output_guardrails.py's two phrase lists.
+            unsafe_instruction = any("unsafe-instruction phrase" in issue for issue in issues)
+            recommended_action = "block" if unsafe_instruction else "release"
             return schema(risk=risk, issues=issues, requires_approval=(risk != "low"),
                           rationale="mock backend: static keyword/PII heuristic scan",
                           policy_violations=policy_violations, recommended_action=recommended_action)

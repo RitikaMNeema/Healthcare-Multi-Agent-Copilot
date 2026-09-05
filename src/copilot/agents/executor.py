@@ -49,18 +49,22 @@ def execute(llm, *, query: str, role: str, request_id: str, user_id: str, audit,
     # The plan is real input to this turn, not just something the planner
     # computed and the executor never sees - it's stated as context, then
     # `plan_followed` records (for audit/tests) whether the model actually
-    # used the tool that plan called for.
+    # used the tool that plan called for. This goes in the *system* prompt,
+    # never prepended to the user message: a tool-calling model (and the mock
+    # backend's naive text-extraction) can echo the literal user-message text
+    # into a tool call's parameters - e.g. `search_payer_policy`'s `query` -
+    # so plan-steering text living there would pollute retrieval with
+    # unrelated terms instead of just steering which tool gets picked.
+    system = SYSTEM_PROMPT
     if task_type:
         steps_text = "; ".join(plan_steps or [])
-        content = f"Planned approach (task_type={task_type}): {steps_text}\n\nRequest: {query}"
-    else:
-        content = query
-    messages: list[dict] = [{"role": "user", "content": content}]
+        system = f"{SYSTEM_PROMPT}\n\nPlanned approach for this request (task_type={task_type}): {steps_text}"
+    messages: list[dict] = [{"role": "user", "content": query}]
     result = ExecutionResult(answer="", used_model=PRIMARY_MODEL)
 
     for _ in range(MAX_TOOL_ITERATIONS):
         def attempt(model: str, _messages=messages):
-            return llm.complete_with_tools(system=SYSTEM_PROMPT, messages=_messages, tools=tool_specs, model=model)
+            return llm.complete_with_tools(system=system, messages=_messages, tools=tool_specs, model=model)
 
         response, used_model = call_with_fallback(attempt, models=[PRIMARY_MODEL, *FALLBACK_MODELS])
         result.used_model = used_model
@@ -149,3 +153,38 @@ def _evidence_text_for(tool_name: str, tool_result: object) -> str | None:
     if isinstance(tool_result, (dict, list)):
         return f"{tool_name}: {str(tool_result)[:800]}"
     return None
+
+
+REVISE_SYSTEM_PROMPT = """You are revising a draft answer from a governed healthcare
+claims/denial-management copilot, in response to specific problems a safety critic found.
+Produce a corrected answer that fixes every listed problem while staying strictly grounded
+in the evidence given - do not introduce any new claim the evidence doesn't support, and do
+not re-word around a problem instead of actually fixing it. If a problem can't be fixed while
+staying grounded in the evidence (e.g. the question simply can't be answered from what was
+retrieved), say so plainly rather than fabricating a fix. Respond with the revised answer text
+only - no preamble, no explanation of what you changed."""
+
+
+def revise(llm, *, query: str, evidence_text: str, draft_answer: str, issues: list[str],
+           policy_violations: list[str]) -> str:
+    """A single, targeted rewrite pass - not a re-run of the tool-calling
+    loop. The evidence is already retrieved; what needs fixing is how the
+    answer uses it, not what was looked up. `graph.py`'s node_revise sends
+    the result back through the full critic pipeline (including claim
+    verification) rather than trusting the revision blindly."""
+    problems = "\n".join(f"- {p}" for p in [*issues, *policy_violations]) or "(no specific problems listed)"
+    content = (
+        f"Original question:\n{query}\n\n"
+        f"Evidence retrieved this turn:\n{evidence_text or '(no evidence was retrieved this turn)'}\n\n"
+        f"Draft answer to revise:\n{draft_answer}\n\n"
+        f"Problems to fix:\n{problems}"
+    )
+
+    def attempt(model: str) -> str:
+        response = llm.complete_with_tools(
+            system=REVISE_SYSTEM_PROMPT, messages=[{"role": "user", "content": content}], tools=[], model=model,
+        )
+        return next((block.text for block in response.content if block.type == "text"), draft_answer)
+
+    revised, _ = call_with_fallback(attempt, models=[PRIMARY_MODEL, *FALLBACK_MODELS])
+    return revised

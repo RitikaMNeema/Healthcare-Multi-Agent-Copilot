@@ -106,7 +106,7 @@ def chat(req: ChatRequest, identity: Identity = Depends(require_identity)) -> Ch
         # reads the actual content through GET /approvals/{id}/detail, which
         # is access-controlled and logged separately.
         return ChatResponse(request_id=request_id, status="pending_approval", risk=result.get("guardrail_risk"))
-    if result.get("blocked"):
+    if result.get("blocked") or result.get("approval_status") == "blocked_by_critic":
         return ChatResponse(request_id=request_id, status="blocked", final_answer=result.get("final_answer"))
     return ChatResponse(request_id=request_id, status="completed", final_answer=result.get("final_answer"))
 
@@ -131,7 +131,7 @@ def chat_status(request_id: str, identity: Identity = Depends(require_identity))
 
     if snapshot.next:  # graph still paused (e.g. awaiting approval)
         return ChatResponse(request_id=request_id, status="pending_approval", risk=snapshot.values.get("guardrail_risk"))
-    if snapshot.values.get("blocked"):
+    if snapshot.values.get("blocked") or snapshot.values.get("approval_status") == "blocked_by_critic":
         return ChatResponse(request_id=request_id, status="blocked", final_answer=snapshot.values.get("final_answer"))
     return ChatResponse(request_id=request_id, status="completed", final_answer=snapshot.values.get("final_answer"))
 

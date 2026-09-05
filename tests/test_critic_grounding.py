@@ -83,7 +83,11 @@ def test_unsupported_claims_force_review_even_when_critic_says_low_risk():
     assert "__interrupt__" in result
 
 
-def test_critic_recommended_block_forces_high_risk():
+def test_critic_recommended_block_is_terminal_not_sent_for_approval():
+    # This is the exact bug the routing redesign closes: recommended_action
+    # "block" must never reach a human reviewer who could release it - it has
+    # to be a dead end, full stop, regardless of what `risk`/`requires_approval`
+    # the critic also reported.
     stub = StubLLM(
         claim_findings=[ClaimFinding(claim="x", verdict="supported", rationale="ok")],
         guardrail_verdict=GuardrailVerdict(
@@ -95,7 +99,49 @@ def test_critic_recommended_block_forces_high_risk():
     _, result = run_request(app, query="Some request", user_id="u1", role="operator")
 
     assert result["guardrail_risk"] == "high"
-    assert result["requires_approval"] is True
+    assert result["approval_status"] == "blocked_by_critic"
+    assert "__interrupt__" not in result  # never even offered to a human reviewer
+    assert result["final_answer"] != result["draft_answer"]  # the draft itself is never released
+
+
+def test_a_blocked_request_cannot_be_released_by_resuming_it():
+    # Defense in depth: even if something tried to resume a blocked_by_critic
+    # request as though it were pending approval, there is no await_approval
+    # interrupt waiting on this thread to resume - the graph already ran to
+    # completion at blocked_by_critic -> END.
+    stub = StubLLM(
+        claim_findings=[ClaimFinding(claim="x", verdict="supported", rationale="ok")],
+        guardrail_verdict=GuardrailVerdict(
+            risk="high", issues=["severe policy violation"], requires_approval=True,
+            rationale="must not be released", recommended_action="block",
+        ),
+    )
+    app = _fresh_app(stub)
+    request_id, result = run_request(app, query="Some request", user_id="u1", role="operator")
+    assert result["approval_status"] == "blocked_by_critic"
+
+    snapshot = app.get_state({"configurable": {"thread_id": request_id}})
+    assert not snapshot.next  # graph has no paused node left to resume
+
+
+def test_revise_loops_back_through_critic_then_falls_back_to_approval():
+    stub = StubLLM(
+        claim_findings=[ClaimFinding(claim="x", verdict="supported", rationale="ok")],
+        guardrail_verdict=GuardrailVerdict(
+            risk="medium", issues=["awkward phrasing"], requires_approval=True,
+            rationale="needs a rewrite", recommended_action="revise",
+        ),
+        draft_answer="An answer that keeps needing revision.",
+    )
+    app = _fresh_app(stub)
+    _, result = run_request(app, query="Some request", user_id="u1", role="operator")
+
+    # The stub's revise() call always returns the same draft, so the critic
+    # keeps saying "revise" - MAX_REVISIONS caps the loop instead of spinning
+    # forever, and the outcome falls back to human review rather than ever
+    # silently releasing an answer the critic never approved.
+    assert result["revision_count"] == 2
+    assert "__interrupt__" in result
 
 
 def test_fully_supported_low_risk_answer_does_not_require_approval():

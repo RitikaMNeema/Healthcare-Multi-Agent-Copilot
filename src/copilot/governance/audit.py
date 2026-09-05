@@ -6,35 +6,31 @@ import uuid
 from contextlib import contextmanager
 
 from copilot.config import default_audit_db_path
+from copilot.governance.migrations import apply_migrations
 from copilot.sqlite_utils import connect as sqlite_connect
 
 GENESIS_HASH = "0" * 64
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS audit_events (
-    id TEXT PRIMARY KEY,
-    request_id TEXT NOT NULL,
-    ts REAL NOT NULL,
-    user_id TEXT,
-    role TEXT,
-    tenant_id TEXT,
-    event_type TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    prev_hash TEXT NOT NULL,
-    entry_hash TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_audit_request ON audit_events(request_id);
-CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_events(tenant_id);
-CREATE TABLE IF NOT EXISTS audit_chain_meta (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    trusted_genesis_hash TEXT NOT NULL
-);
-"""
+
+def _compute_entry_hash_v1(prev_hash: str, *, event_id: str, request_id: str, ts: float,
+                            user_id: str | None, role: str | None,
+                            event_type: str, payload_json: str) -> str:
+    """The pre-tenancy hash algorithm - canonical JSON has no tenant_id key
+    at all (not even null). Only ever used to *verify* rows written before
+    migration 2 added tenant_id; never used for new writes. Do not add
+    fields here - a row's original hash is fixed forever once written, and
+    this function exists solely to reproduce it."""
+    canonical = json.dumps(
+        {"id": event_id, "request_id": request_id, "ts": ts, "user_id": user_id,
+         "role": role, "event_type": event_type, "payload": payload_json},
+        sort_keys=True,
+    )
+    return hashlib.sha256((prev_hash + canonical).encode("utf-8")).hexdigest()
 
 
-def _compute_entry_hash(prev_hash: str, *, event_id: str, request_id: str, ts: float,
-                         user_id: str | None, role: str | None, tenant_id: str | None,
-                         event_type: str, payload_json: str) -> str:
+def _compute_entry_hash_v2(prev_hash: str, *, event_id: str, request_id: str, ts: float,
+                            user_id: str | None, role: str | None, tenant_id: str | None,
+                            event_type: str, payload_json: str) -> str:
     canonical = json.dumps(
         {"id": event_id, "request_id": request_id, "ts": ts, "user_id": user_id,
          "role": role, "tenant_id": tenant_id, "event_type": event_type, "payload": payload_json},
@@ -70,10 +66,7 @@ class AuditLog:
         self.db_path = db_path or default_audit_db_path()
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         with self._connect() as conn:
-            conn.executescript(SCHEMA)
-            conn.execute(
-                "INSERT OR IGNORE INTO audit_chain_meta (id, trusted_genesis_hash) VALUES (1, ?)", (GENESIS_HASH,),
-            )
+            apply_migrations(conn)
 
     @contextmanager
     def _connect(self):
@@ -100,7 +93,7 @@ class AuditLog:
             conn.execute("BEGIN IMMEDIATE")
             last_hash_row = conn.execute("SELECT entry_hash FROM audit_events ORDER BY rowid DESC LIMIT 1").fetchone()
             prev_hash = last_hash_row[0] if last_hash_row else GENESIS_HASH
-            entry_hash = _compute_entry_hash(
+            entry_hash = _compute_entry_hash_v2(
                 prev_hash, event_id=event_id, request_id=request_id, ts=ts,
                 user_id=user_id, role=role, tenant_id=tenant_id, event_type=event_type, payload_json=payload_json,
             )
@@ -169,23 +162,41 @@ class AuditLog:
         previous entry's stored hash. Returns (True, None) if the chain is
         intact, or (False, id_of_first_broken_entry) at the first mismatch -
         everything after that point is unverifiable regardless of whether it
-        was itself altered."""
+        was itself altered.
+
+        Rows at or before `legacy_hash_boundary_rowid` (set once, at
+        migration time - see migrations.py) predate tenant_id and are
+        verified with the original pre-tenancy algorithm; everything after
+        uses the current one. Without this split, every database that has
+        ever been migrated would recompute a different hash than what a
+        legacy row was actually stored with and get flagged as 100% tampered
+        - a false alarm, not a real one."""
         with self._connect() as conn:
-            meta_row = conn.execute("SELECT trusted_genesis_hash FROM audit_chain_meta WHERE id = 1").fetchone()
+            meta_row = conn.execute(
+                "SELECT trusted_genesis_hash, legacy_hash_boundary_rowid FROM audit_chain_meta WHERE id = 1",
+            ).fetchone()
             rows = conn.execute(
-                "SELECT id, request_id, ts, user_id, role, tenant_id, event_type, payload, prev_hash, entry_hash "
+                "SELECT rowid, id, request_id, ts, user_id, role, tenant_id, event_type, payload, prev_hash, entry_hash "
                 "FROM audit_events ORDER BY rowid",
             ).fetchall()
 
         expected_prev = meta_row[0] if meta_row else GENESIS_HASH
+        legacy_boundary = meta_row[1] if meta_row else 0
         for row in rows:
-            event_id, request_id, ts, user_id, role, tenant_id, event_type, payload_json, stored_prev, stored_entry = row
+            (rowid, event_id, request_id, ts, user_id, role, tenant_id, event_type, payload_json,
+             stored_prev, stored_entry) = row
             if stored_prev != expected_prev:
                 return False, event_id
-            recomputed = _compute_entry_hash(
-                stored_prev, event_id=event_id, request_id=request_id, ts=ts,
-                user_id=user_id, role=role, tenant_id=tenant_id, event_type=event_type, payload_json=payload_json,
-            )
+            if rowid <= legacy_boundary:
+                recomputed = _compute_entry_hash_v1(
+                    stored_prev, event_id=event_id, request_id=request_id, ts=ts,
+                    user_id=user_id, role=role, event_type=event_type, payload_json=payload_json,
+                )
+            else:
+                recomputed = _compute_entry_hash_v2(
+                    stored_prev, event_id=event_id, request_id=request_id, ts=ts,
+                    user_id=user_id, role=role, tenant_id=tenant_id, event_type=event_type, payload_json=payload_json,
+                )
             if recomputed != stored_entry:
                 return False, event_id
             expected_prev = stored_entry

@@ -23,6 +23,11 @@ from copilot.state import CopilotState
 
 _RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
 
+# Caps the revise <-> critic loop. A critic that keeps saying "revise" after
+# this many attempts gets treated as "needs a human, not another automated
+# pass" rather than looping forever or silently giving up and releasing.
+MAX_REVISIONS = 2
+
 
 def _default_checkpointer() -> SqliteSaver:
     """Persist graph state to disk (not just in-process memory) so a paused,
@@ -120,11 +125,14 @@ def build_graph(
                 evidence_doc_sources=set(state.get("evidence_doc_sources", [])),
                 evidence_claim_ids=set(state.get("evidence_claim_ids", [])),
             )
-            # An unverified citation, an unsupported claim, or a critic-recommended
-            # block are each independently at least a medium-risk finding (block
-            # forces high) - a plausible-looking but ungrounded answer is exactly
-            # the kind of thing that should stop for human review even if the
-            # critic's own `risk` field under-called it.
+            # An unverified citation or an unsupported claim is each independently
+            # at least a medium-risk finding - a plausible-looking but ungrounded
+            # answer is exactly the kind of thing that should stop for human
+            # review even if the critic's own `risk` field under-called it. A
+            # critic-recommended "block" is reported as high risk here for
+            # audit/reporting purposes, but routing around approval entirely
+            # (see route_after_critic) - not the risk score - is what actually
+            # keeps a block from being releasable by a reviewer.
             risks = [static_risk, verdict.risk]
             if citation_issues or unsupported_claims:
                 risks.append("medium")
@@ -160,7 +168,55 @@ def build_graph(
                 "policy_violations": verdict.policy_violations, "recommended_action": verdict.recommended_action,
             }
 
+    def node_revise(state: CopilotState) -> dict:
+        with tracing.span("node.revise", request_id=state["request_id"], role=state["role"]):
+            revised = executor_agent.revise(
+                llm, query=state["query"], evidence_text="\n\n".join(state.get("evidence_text", [])),
+                draft_answer=state["draft_answer"], issues=state.get("guardrail_issues", []),
+                policy_violations=state.get("policy_violations", []),
+            )
+            revision_count = state.get("revision_count", 0) + 1
+            audit.log(
+                request_id=state["request_id"], event_type="answer_revised",
+                user_id=state["user_id"], role=state["role"], tenant_id=state.get("tenant_id"),
+                payload={"revision_count": revision_count, "revised_answer_length": len(revised)},
+            )
+            # Routes back to `critic` (see graph wiring below) - the revision is
+            # never trusted blindly, it goes through the full critic pipeline
+            # again, claim verification included, exactly like the original draft.
+            return {"draft_answer": revised, "revision_count": revision_count}
+
+    def node_blocked_by_critic(state: CopilotState) -> dict:
+        # Terminal and unconditional: unlike needs_approval, there is no path
+        # from here to release. A human reviewer approving a request never
+        # reaches this node's output - block means block, not "elevate to
+        # high risk and let a person overrule it" (that was the bug this node
+        # exists to close - see tests/test_critic_grounding.py).
+        audit.log(
+            request_id=state["request_id"], event_type="blocked_by_critic",
+            user_id=state["user_id"], role=state["role"], tenant_id=state.get("tenant_id"),
+            payload={
+                "policy_violations": [redact_text(v) for v in state.get("policy_violations", [])],
+                "rationale": "critic recommended_action=block",
+            },
+        )
+        return {
+            "approval_status": "blocked_by_critic",
+            "final_answer": "This response was blocked by the safety critic and cannot be released, "
+                             "including by human approval.",
+        }
+
     def route_after_critic(state: CopilotState) -> str:
+        # "block" is unconditional and bypasses approval entirely - a human
+        # reviewer must never be offered the chance to release it. This check
+        # runs before, and independent of, the risk-based approval gate below.
+        if state.get("recommended_action") == "block":
+            return "blocked_by_critic"
+        # "revise" gets a bounded number of automated fix-it attempts before
+        # falling back to requiring a human - never looped forever, and never
+        # silently released just because revision attempts ran out.
+        if state.get("recommended_action") == "revise" and state.get("revision_count", 0) < MAX_REVISIONS:
+            return "revise"
         # No role bypasses review above low risk - not even admin. Auto-release
         # is reserved for content the guardrails classified as low risk;
         # everything else needs a reviewer who isn't the requester (enforced
@@ -235,6 +291,8 @@ def build_graph(
     graph.add_node("plan", node_plan)
     graph.add_node("execute", node_execute)
     graph.add_node("critic", node_critic)
+    graph.add_node("revise", node_revise)
+    graph.add_node("blocked_by_critic", node_blocked_by_critic)
     graph.add_node("request_approval", node_request_approval)
     graph.add_node("await_approval", node_await_approval)
     graph.add_node("finalize", node_finalize)
@@ -244,7 +302,12 @@ def build_graph(
     graph.add_edge("blocked", END)
     graph.add_edge("plan", "execute")
     graph.add_edge("execute", "critic")
-    graph.add_conditional_edges("critic", route_after_critic, {"needs_approval": "request_approval", "finalize": "finalize"})
+    graph.add_conditional_edges("critic", route_after_critic, {
+        "needs_approval": "request_approval", "finalize": "finalize",
+        "revise": "revise", "blocked_by_critic": "blocked_by_critic",
+    })
+    graph.add_edge("revise", "critic")
+    graph.add_edge("blocked_by_critic", END)
     graph.add_edge("request_approval", "await_approval")
     graph.add_edge("await_approval", "finalize")
     graph.add_edge("finalize", END)

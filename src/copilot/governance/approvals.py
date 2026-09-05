@@ -3,21 +3,8 @@ import time
 from contextlib import contextmanager
 
 from copilot.config import default_audit_db_path
+from copilot.governance.migrations import apply_migrations
 from copilot.sqlite_utils import connect as sqlite_connect
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS pending_approvals (
-    request_id TEXT PRIMARY KEY,
-    created_at REAL NOT NULL,
-    requester_user_id TEXT,
-    tenant_id TEXT,
-    summary TEXT NOT NULL,
-    risk TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    decided_by TEXT,
-    decided_at REAL
-);
-"""
 
 
 class AlreadyDecidedError(Exception):
@@ -48,7 +35,7 @@ class ApprovalQueue:
         self.db_path = db_path or default_audit_db_path()
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         with self._connect() as conn:
-            conn.executescript(SCHEMA)
+            apply_migrations(conn)
 
     @contextmanager
     def _connect(self):

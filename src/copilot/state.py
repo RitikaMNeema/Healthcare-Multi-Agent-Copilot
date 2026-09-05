@@ -29,6 +29,7 @@ class CopilotState(TypedDict, total=False):
     unsupported_claims: list[str]
     policy_violations: list[str]
     recommended_action: str
+    revision_count: int
 
     approval_status: str
     final_answer: str
